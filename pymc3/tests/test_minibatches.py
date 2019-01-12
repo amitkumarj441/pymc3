@@ -13,7 +13,7 @@ from pymc3.tests.helpers import select_by_precision
 from pymc3.theanof import GeneratorOp
 
 
-class _DataSampler(object):
+class _DataSampler:
     """
     Not for users
     """
@@ -57,7 +57,7 @@ def integers_ndim(ndim):
 
 
 @pytest.mark.usefixtures('strict_float32')
-class TestGenerator(object):
+class TestGenerator:
 
     def test_basic(self):
         generator = GeneratorAdapter(integers())
@@ -148,7 +148,7 @@ def gen2():
         i += 1
 
 
-class TestScaling(object):
+class TestScaling:
     """
     Related to minibatch training
     """
@@ -279,7 +279,7 @@ class TestScaling(object):
 
 
 @pytest.mark.usefixtures('strict_float32')
-class TestMinibatch(object):
+class TestMinibatch:
     data = np.random.rand(30, 10, 40, 10, 50)
 
     def test_1d(self):
@@ -313,3 +313,21 @@ class TestMinibatch(object):
         res1 = theano.clone(res, {gop: shared})
         f = theano.function([], res1)
         assert f() == np.array([100])
+
+    def test_align(self):
+        m = pm.Minibatch(np.arange(1000), 1, random_seed=1)
+        n = pm.Minibatch(np.arange(1000), 1, random_seed=1)
+        f = theano.function([], [m, n])
+        n.eval()  # not aligned
+        a, b = zip(*(f() for _ in range(1000)))
+        assert a != b
+        pm.align_minibatches()
+        a, b = zip(*(f() for _ in range(1000)))
+        assert a == b
+        n.eval()  # not aligned
+        pm.align_minibatches([m])
+        a, b = zip(*(f() for _ in range(1000)))
+        assert a != b
+        pm.align_minibatches([m, n])
+        a, b = zip(*(f() for _ in range(1000)))
+        assert a == b

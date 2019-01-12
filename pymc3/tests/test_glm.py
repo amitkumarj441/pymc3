@@ -16,7 +16,7 @@ def generate_data(intercept, slope, size=700):
 class TestGLM(SeededTest):
     @classmethod
     def setup_class(cls):
-        super(TestGLM, cls).setup_class()
+        super().setup_class()
         cls.intercept = 1
         cls.slope = 3
         cls.sd = .05
@@ -26,14 +26,18 @@ class TestGLM(SeededTest):
 
         x_logistic, y_logistic = generate_data(cls.intercept, cls.slope, size=3000)
         y_logistic = 1 / (1 + np.exp(-y_logistic))
-        bern_trials = [np.random.binomial(1, i) for i in y_logistic]
+        bern_trials = np.random.binomial(1, y_logistic)
         cls.data_logistic = dict(x=x_logistic, y=bern_trials)
+
+        n_trials = np.random.randint(1, 20, size=y_logistic.shape)
+        binom_trials = np.random.binomial(n_trials, y_logistic)
+        cls.data_logistic2 = dict(x=x_logistic, y=binom_trials, n=n_trials)
 
     def test_linear_component(self):
         with Model() as model:
             lm = LinearComponent.from_formula('y ~ x', self.data_linear)
             sigma = Uniform('sigma', 0, 20)
-            Normal('y_obs', mu=lm.y_est, sd=sigma, observed=self.y_linear)
+            Normal('y_obs', mu=lm.y_est, sigma=sigma, observed=self.y_linear)
             start = find_MAP(vars=[sigma])
             step = Slice(model.vars)
             trace = sample(500, tune=0, step=step, start=start,
@@ -54,12 +58,32 @@ class TestGLM(SeededTest):
             assert round(abs(np.mean(trace['x'])-self.slope), 1) == 0
             assert round(abs(np.mean(trace['sd'])-self.sd), 1) == 0
 
+    def test_glm_offset(self):
+        offset = 1.
+        with Model() as model:
+            GLM.from_formula('y ~ x', self.data_linear, offset=offset)
+            step = Slice(model.vars)
+            trace = sample(500, step=step, tune=0, progressbar=False,
+                           random_seed=self.random_seed)
+
+            assert round(abs(np.mean(trace['Intercept'])-self.intercept+offset), 1) == 0
+
     def test_glm_link_func(self):
         with Model() as model:
             GLM.from_formula('y ~ x', self.data_logistic,
                     family=families.Binomial(link=families.logit))
             step = Slice(model.vars)
             trace = sample(1000, step=step, tune=0, progressbar=False,
+                           random_seed=self.random_seed)
+
+            assert round(abs(np.mean(trace['Intercept'])-self.intercept), 1) == 0
+            assert round(abs(np.mean(trace['x'])-self.slope), 1) == 0
+
+    def test_glm_link_func2(self):
+        with Model() as model:
+            GLM.from_formula('y ~ x', self.data_logistic2,
+                    family=families.Binomial(priors={'n': self.data_logistic2['n']}))
+            trace = sample(1000, progressbar=False,
                            random_seed=self.random_seed)
 
             assert round(abs(np.mean(trace['Intercept'])-self.intercept), 1) == 0

@@ -63,7 +63,7 @@ def partial_check_positive_definite(C):
 
 class PositiveDefiniteError(ValueError):
     def __init__(self, msg, idx):
-        super(PositiveDefiniteError, self).__init__(msg)
+        super().__init__(msg)
         self.idx = idx
         self.msg = msg
 
@@ -72,7 +72,7 @@ class PositiveDefiniteError(ValueError):
                 % (self.msg, self.idx))
 
 
-class QuadPotential(object):
+class QuadPotential:
     def velocity(self, x, out=None):
         """Compute the current velocity at a position in parameter space."""
         raise NotImplementedError('Abstract method')
@@ -86,12 +86,33 @@ class QuadPotential(object):
     def velocity_energy(self, x, v_out):
         raise NotImplementedError('Abstract method')
 
-    def adapt(self, sample, grad):
+    def update(self, sample, grad, tune):
         """Inform the potential about a new sample during tuning.
 
         This can be used by adaptive potentials to change the
         mass matrix.
         """
+        pass
+
+    def raise_ok(self, vmap=None):
+        """Check if the mass matrix is ok, and raise ValueError if not.
+
+        Parameters
+        ----------
+        vmap : blocking.ArrayOrdering.vmap
+            List of `VarMap`s, which are namedtuples with var, slc, shp, dtyp
+
+        Raises
+        ------
+        ValueError if any standard deviations are 0 or infinite
+
+        Returns
+        -------
+        None
+        """
+        return None
+
+    def reset(self):
         pass
 
 
@@ -104,7 +125,7 @@ class QuadPotentialDiagAdapt(QuadPotential):
     """Adapt a diagonal mass matrix from the sample variances."""
 
     def __init__(self, n, initial_mean, initial_diag=None, initial_weight=0,
-                 adaptation_window=100, dtype=None):
+                 adaptation_window=101, dtype=None):
         """Set up a diagonal mass matrix."""
         if initial_diag is not None and initial_diag.ndim != 1:
             raise ValueError('Initial diagonal must be one-dimensional.')
@@ -162,8 +183,11 @@ class QuadPotentialDiagAdapt(QuadPotential):
         np.divide(1, self._stds, out=self._inv_stds)
         self._var_theano.set_value(self._var)
 
-    def adapt(self, sample, grad):
+    def update(self, sample, grad, tune):
         """Inform the potential about a new sample during tuning."""
+        if not tune:
+            return
+
         window = self.adaptation_window
 
         self._foreground_var.add_sample(sample, weight=1)
@@ -176,6 +200,50 @@ class QuadPotentialDiagAdapt(QuadPotential):
 
         self._n_samples += 1
 
+    def raise_ok(self, vmap):
+        """Check if the mass matrix is ok, and raise ValueError if not.
+
+        Parameters
+        ----------
+        vmap : blocking.ArrayOrdering.vmap
+            List of `VarMap`s, which are namedtuples with var, slc, shp, dtyp
+
+        Raises
+        ------
+        ValueError if any standard deviations are 0 or infinite
+
+        Returns
+        -------
+        None
+        """
+        if np.any(self._stds == 0):
+            name_slc = []
+            tmp_hold = list(range(self._stds.size))
+            for vmap_ in vmap:
+                slclen = len(tmp_hold[vmap_.slc])
+                for i in range(slclen):
+                    name_slc.append((vmap_.var, i))
+            index = np.where(self._stds == 0)[0]
+            errmsg = ['Mass matrix contains zeros on the diagonal. ']
+            for ii in index:
+                errmsg.append('The derivative of RV `{}`.ravel()[{}]'
+                              ' is zero.'.format(*name_slc[ii]))
+            raise ValueError('\n'.join(errmsg))
+
+        if np.any(~np.isfinite(self._stds)):
+            name_slc = []
+            tmp_hold = list(range(self._stds.size))
+            for vmap_ in vmap:
+                slclen = len(tmp_hold[vmap_.slc])
+                for i in range(slclen):
+                    name_slc.append((vmap_.var, i))
+            index = np.where(~np.isfinite(self._stds))[0]
+            errmsg = ['Mass matrix contains non-finite values on the diagonal. ']
+            for ii in index:
+                errmsg.append('The derivative of RV `{}`.ravel()[{}]'
+                              ' is non-finite.'.format(*name_slc[ii]))
+            raise ValueError('\n'.join(errmsg))
+
 
 class QuadPotentialDiagAdaptGrad(QuadPotentialDiagAdapt):
     """Adapt a diagonal mass matrix from the variances of the gradients.
@@ -184,7 +252,7 @@ class QuadPotentialDiagAdaptGrad(QuadPotentialDiagAdapt):
     """
 
     def __init__(self, *args, **kwargs):
-        super(QuadPotentialDiagAdaptGrad, self).__init__(*args, **kwargs)
+        super().__init__(*args, **kwargs)
         self._grads1 = np.zeros(self._n, dtype=self.dtype)
         self._ngrads1 = 0
         self._grads2 = np.zeros(self._n, dtype=self.dtype)
@@ -196,15 +264,18 @@ class QuadPotentialDiagAdaptGrad(QuadPotentialDiagAdapt):
         np.divide(1, self._stds, out=self._inv_stds)
         self._var_theano.set_value(self._var)
 
-    def adapt(self, sample, grad):
+    def update(self, sample, grad, tune):
         """Inform the potential about a new sample during tuning."""
+        if not tune:
+            return
+
         self._grads1[:] += np.abs(grad)
         self._grads2[:] += np.abs(grad)
         self._ngrads1 += 1
         self._ngrads2 += 1
 
         if self._n_samples <= 150:
-            super().adapt(sample, grad)
+            super().update(sample, grad)
         else:
             self._update((self._ngrads1 / self._grads1) ** 2)
 
@@ -215,7 +286,7 @@ class QuadPotentialDiagAdaptGrad(QuadPotentialDiagAdapt):
             self._grads2[:] = 1
 
 
-class _WeightedVariance(object):
+class _WeightedVariance:
     """Online algorithm for computing mean of variance."""
 
     def __init__(self, nelem, initial_mean=None, initial_variance=None,

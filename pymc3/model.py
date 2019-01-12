@@ -2,22 +2,23 @@ import collections
 import functools
 import itertools
 import threading
-import six
+import warnings
 
 import numpy as np
+from pandas import Series
 import scipy.sparse as sps
 import theano.sparse as sparse
 from theano import theano, tensor as tt
 from theano.tensor.var import TensorVariable
 
-from pymc3.theanof import set_theano_conf
+from pymc3.theanof import set_theano_conf, floatX
 import pymc3 as pm
 from pymc3.math import flatten_list
-from .memoize import memoize
+from .memoize import memoize, WithMemoization
 from .theanof import gradient, hessian, inputvars, generator
 from .vartypes import typefilter, discrete_types, continuous_types, isgenerator
 from .blocking import DictToArrayBijection, ArrayOrdering
-from .util import get_transformed_name, escape_latex
+from .util import get_transformed_name
 
 __all__ = [
     'Model', 'Factor', 'compilef', 'fn', 'fastfn', 'modelcontext',
@@ -27,7 +28,7 @@ __all__ = [
 FlatView = collections.namedtuple('FlatView', 'input, replacements, view')
 
 
-class InstanceMethod(object):
+class InstanceMethod:
     """Class for hiding references to instance methods so they can be pickled.
 
     >>> self.method = InstanceMethod(some_object, 'method_name')
@@ -78,32 +79,78 @@ def incorporate_methods(source, destination, methods, default=None,
         else:
             setattr(destination, method, None)
 
-
-def get_named_nodes(graph):
-    """Get the named nodes in a theano graph
-    (i.e., nodes whose name attribute is not None).
+def get_named_nodes_and_relations(graph):
+    """Get the named nodes in a theano graph (i.e., nodes whose name
+    attribute is not None) along with their relationships (i.e., the
+    node's named parents, and named children, while skipping unnamed
+    intermediate nodes)
 
     Parameters
     ----------
     graph - a theano node
 
     Returns:
-    A dictionary of name:node pairs.
+    leaf_nodes: A dictionary of name:node pairs, of the named nodes that
+        are also leafs of the graph
+    node_parents: A dictionary of node:set([parents]) pairs. Each key is
+        a theano named node, and the corresponding value is the set of
+        theano named nodes that are parents of the node. These parental
+        relations skip unnamed intermediate nodes.
+    node_children: A dictionary of node:set([children]) pairs. Each key
+        is a theano named node, and the corresponding value is the set
+        of theano named nodes that are children of the node. These child
+        relations skip unnamed intermediate nodes.
+
     """
-    return _get_named_nodes(graph, {})
-
-
-def _get_named_nodes(graph, nodes):
-    if graph.owner is None:
-        if graph.name is not None:
-            nodes.update({graph.name: graph})
+    if graph.name is not None:
+        node_parents = {graph: set()}
+        node_children = {graph: set()}
     else:
+        node_parents = {}
+        node_children = {}
+    return _get_named_nodes_and_relations(graph, None, {}, node_parents, node_children)
+
+def _get_named_nodes_and_relations(graph, parent, leaf_nodes,
+                                        node_parents, node_children):
+    if getattr(graph, 'owner', None) is None:  # Leaf node
+        if graph.name is not None:  # Named leaf node
+            leaf_nodes.update({graph.name: graph})
+            if parent is not None:  # Is None for the root node
+                try:
+                    node_parents[graph].add(parent)
+                except KeyError:
+                    node_parents[graph] = {parent}
+                node_children[parent].add(graph)
+            else:
+                node_parents[graph] = set()
+            # Flag that the leaf node has no children
+            node_children[graph] = set()
+    else:  # Intermediate node
+        if graph.name is not None:  # Intermediate named node
+            if parent is not None:  # Is only None for the root node
+                try:
+                    node_parents[graph].add(parent)
+                except KeyError:
+                    node_parents[graph] = {parent}
+                node_children[parent].add(graph)
+            else:
+                node_parents[graph] = set()
+            # The current node will be set as the parent of the next
+            # nodes only if it is a named node
+            parent = graph
+            # Init the nodes children to an empty set
+            node_children[graph] = set()
         for i in graph.owner.inputs:
-            nodes.update(_get_named_nodes(i, nodes))
-    return nodes
+            temp_nodes, temp_inter, temp_tree = \
+                _get_named_nodes_and_relations(i, parent, leaf_nodes,
+                                               node_parents, node_children)
+            leaf_nodes.update(temp_nodes)
+            node_parents.update(temp_inter)
+            node_children.update(temp_tree)
+    return leaf_nodes, node_parents, node_children
 
 
-class Context(object):
+class Context:
     """Functionality for objects that put themselves in a context using
     the `with` statement.
     """
@@ -148,12 +195,12 @@ def modelcontext(model):
     return model
 
 
-class Factor(object):
+class Factor:
     """Common functionality for objects with a log probability density
     associated with them.
     """
     def __init__(self, *args, **kwargs):
-        super(Factor, self).__init__(*args, **kwargs)
+        super().__init__(*args, **kwargs)
 
     @property
     def logp(self):
@@ -261,7 +308,7 @@ class treelist(list):
     Extending treelist you will also extend its parent
     """
     def __init__(self, iterable=(), parent=None):
-        super(treelist, self).__init__(iterable)
+        super().__init__(iterable)
         assert isinstance(parent, list) or parent is None
         self.parent = parent
         if self.parent is not None:
@@ -299,7 +346,7 @@ class treedict(dict):
     Extending treedict you will also extend its parent
     """
     def __init__(self, iterable=(), parent=None, **kwargs):
-        super(treedict, self).__init__(iterable, **kwargs)
+        super().__init__(iterable, **kwargs)
         assert isinstance(parent, dict) or parent is None
         self.parent = parent
         if self.parent is not None:
@@ -320,7 +367,7 @@ class treedict(dict):
             return dict.__contains__(self, item)
 
 
-class ValueGradFunction(object):
+class ValueGradFunction:
     """Create a theano function that computes a value and its gradient.
 
     Parameters
@@ -381,7 +428,7 @@ class ValueGradFunction(object):
                 raise TypeError('Invalid dtype for variable %s. Can not '
                                 'cast to %s with casting rule %s.'
                                 % (var.name, self.dtype, casting))
-            if not np.issubdtype(var.dtype, float):
+            if not np.issubdtype(var.dtype, np.floating):
                 raise TypeError('Invalid dtype for variable %s. Must be '
                                 'floating point but is %s.'
                                 % (var.name, var.dtype))
@@ -487,89 +534,97 @@ class ValueGradFunction(object):
         return args_joined, theano.clone(cost, replace=replace)
 
 
-class Model(six.with_metaclass(InitContextMeta, Context, Factor)):
+class Model(Context, Factor, WithMemoization, metaclass=InitContextMeta):
     """Encapsulates the variables and likelihood factors of a model.
 
     Model class can be used for creating class based models. To create
-    a class based model you should inherit from `Model` and
-    override `__init__` with arbitrary definitions
-    (do not forget to call base class `__init__` first).
+    a class based model you should inherit from :class:`~.Model` and
+    override :meth:`~.__init__` with arbitrary definitions (do not
+    forget to call base class :meth:`__init__` first).
 
     Parameters
     ----------
-    name : str, default '' - name that will be used as prefix for
-        names of all random variables defined within model
-    model : Model, default None - instance of Model that is
-        supposed to be a parent for the new instance. If None,
-        context will be used. All variables defined within instance
-        will be passed to the parent instance. So that 'nested' model
-        contributes to the variables and likelihood factors of
-        parent model.
-    theano_config : dict, default=None
+    name : str
+        name that will be used as prefix for names of all random
+        variables defined within model
+    model : Model
+        instance of Model that is supposed to be a parent for the new
+        instance. If ``None``, context will be used. All variables
+        defined within instance will be passed to the parent instance.
+        So that 'nested' model contributes to the variables and
+        likelihood factors of parent model.
+    theano_config : dict
         A dictionary of theano config values that should be set
         temporarily in the model context. See the documentation
-        of theano for a complete list. Set `compute_test_value` to
-        `raise` if it is None.
+        of theano for a complete list. Set config key
+        ``compute_test_value`` to `raise` if it is None.
 
     Examples
     --------
-    # How to define a custom model
-    class CustomModel(Model):
-        # 1) override init
-        def __init__(self, mean=0, sd=1, name='', model=None):
-            # 2) call super's init first, passing model and name to it
-            # name will be prefix for all variables here
-            # if no name specified for model there will be no prefix
-            super(CustomModel, self).__init__(name, model)
-            # now you are in the context of instance,
-            # `modelcontext` will return self
-            # you can define variables in several ways
-            # note, that all variables will get model's name prefix
 
-            # 3) you can create variables with Var method
-            self.Var('v1', Normal.dist(mu=mean, sd=sd))
-            # this will create variable named like '{prefix_}v1'
-            # and assign attribute 'v1' to instance
-            # created variable can be accessed with self.v1 or self['v1']
+    How to define a custom model
 
-            # 4) this syntax will also work as we are in the context
-            # of instance itself, names are given as usual
-            Normal('v2', mu=mean, sd=sd)
+    .. code-block:: python
 
-            # something more complex is allowed too
-            Normal('v3', mu=mean, sd=HalfCauchy('sd', beta=10, testval=1.))
+        class CustomModel(Model):
+            # 1) override init
+            def __init__(self, mean=0, sigma=1, name='', model=None):
+                # 2) call super's init first, passing model and name
+                # to it name will be prefix for all variables here if
+                # no name specified for model there will be no prefix
+                super().__init__(name, model)
+                # now you are in the context of instance,
+                # `modelcontext` will return self you can define
+                # variables in several ways note, that all variables
+                # will get model's name prefix
 
-            # Deterministic variables can be used in usual way
-            Deterministic('v3_sq', self.v3 ** 2)
-            # Potentials too
-            Potential('p1', tt.constant(1))
+                # 3) you can create variables with Var method
+                self.Var('v1', Normal.dist(mu=mean, sigma=sd))
+                # this will create variable named like '{prefix_}v1'
+                # and assign attribute 'v1' to instance created
+                # variable can be accessed with self.v1 or self['v1']
 
-    # After defining a class CustomModel you can use it in several ways
+                # 4) this syntax will also work as we are in the
+                # context of instance itself, names are given as usual
+                Normal('v2', mu=mean, sigma=sd)
 
-    # I:
-    #   state the model within a context
-    with Model() as model:
-        CustomModel()
-        # arbitrary actions
+                # something more complex is allowed, too
+                half_cauchy = HalfCauchy('sd', beta=10, testval=1.)
+                Normal('v3', mu=mean, sigma=half_cauchy)
 
-    # II:
-    #   use new class as entering point in context
-    with CustomModel() as model:
-        Normal('new_normal_var', mu=1, sd=0)
+                # Deterministic variables can be used in usual way
+                Deterministic('v3_sq', self.v3 ** 2)
 
-    # III:
-    #   just get model instance with all that was defined in it
-    model = CustomModel()
+                # Potentials too
+                Potential('p1', tt.constant(1))
 
-    # IV:
-    #   use many custom models within one context
-    with Model() as model:
-        CustomModel(mean=1, name='first')
-        CustomModel(mean=2, name='second')
+        # After defining a class CustomModel you can use it in several
+        # ways
+
+        # I:
+        #   state the model within a context
+        with Model() as model:
+            CustomModel()
+            # arbitrary actions
+
+        # II:
+        #   use new class as entering point in context
+        with CustomModel() as model:
+            Normal('new_normal_var', mu=1, sigma=0)
+
+        # III:
+        #   just get model instance with all that was defined in it
+        model = CustomModel()
+
+        # IV:
+        #   use many custom models within one context
+        with Model() as model:
+            CustomModel(mean=1, name='first')
+            CustomModel(mean=2, name='second')
     """
     def __new__(cls, *args, **kwargs):
         # resolves the parent instance
-        instance = object.__new__(cls)
+        instance = super().__new__(cls)
         if kwargs.get('model') is not None:
             instance._parent = kwargs.get('model')
         elif cls.get_contexts():
@@ -619,9 +674,9 @@ class Model(six.with_metaclass(InitContextMeta, Context, Factor)):
         return self.parent is None
 
     @property
-    @memoize
+    @memoize(bound=True)
     def bijection(self):
-        vars = inputvars(self.cont_vars)
+        vars = inputvars(self.vars)
 
         bij = DictToArrayBijection(ArrayOrdering(vars),
                                    self.test_point)
@@ -661,10 +716,8 @@ class Model(six.with_metaclass(InitContextMeta, Context, Factor)):
     def logpt(self):
         """Theano scalar of log-probability of the model"""
         with self:
-            factors = [var.logpt for var in self.basic_RVs]
-            logp_factors = tt.sum(factors)
-            logp_potentials = tt.sum([tt.sum(pot) for pot in self.potentials])
-            logp = logp_factors + logp_potentials
+            factors = [var.logpt for var in self.basic_RVs] + self.potentials
+            logp = tt.sum([tt.sum(factor) for factor in factors])
             if self.name:
                 logp.name = '__logp_%s' % self.name
             else:
@@ -688,7 +741,14 @@ class Model(six.with_metaclass(InitContextMeta, Context, Factor)):
         """Theano scalar of log-probability of the unobserved random variables
            (excluding deterministic)."""
         with self:
-            factors = [var.logpt for var in self.vars]
+            factors = [var.logpt for var in self.free_RVs]
+            return tt.sum(factors)
+
+    @property
+    def datalogpt(self):
+        with self:
+            factors = [var.logpt for var in self.observed_RVs]
+            factors += [tt.sum(factor) for factor in self.potentials]
             return tt.sum(factors)
 
     @property
@@ -738,7 +798,7 @@ class Model(six.with_metaclass(InitContextMeta, Context, Factor)):
            If data is provided, the variable is observed. If None,
            the variable is unobserved.
         total_size : scalar
-            upscales logp of variable with :math:`coef = total_size/var.shape[0]`
+            upscales logp of variable with ``coef = total_size/var.shape[0]``
 
         Returns
         -------
@@ -833,8 +893,8 @@ class Model(six.with_metaclass(InitContextMeta, Context, Factor)):
                 raise e
 
     def makefn(self, outs, mode=None, *args, **kwargs):
-        """Compiles a Theano function which returns `outs` and takes the variable
-        ancestors of `outs` as inputs.
+        """Compiles a Theano function which returns ``outs`` and takes the variable
+        ancestors of ``outs`` as inputs.
 
         Parameters
         ----------
@@ -853,7 +913,7 @@ class Model(six.with_metaclass(InitContextMeta, Context, Factor)):
                                    mode=mode, *args, **kwargs)
 
     def fn(self, outs, mode=None, *args, **kwargs):
-        """Compiles a Theano function which returns the values of `outs`
+        """Compiles a Theano function which returns the values of ``outs``
         and takes values of model vars as arguments.
 
         Parameters
@@ -868,7 +928,7 @@ class Model(six.with_metaclass(InitContextMeta, Context, Factor)):
         return LoosePointFunc(self.makefn(outs, mode, *args, **kwargs), self)
 
     def fastfn(self, outs, mode=None, *args, **kwargs):
-        """Compiles a Theano function which returns `outs` and takes values
+        """Compiles a Theano function which returns ``outs`` and takes values
         of model vars as a dict as an argument.
 
         Parameters
@@ -884,7 +944,7 @@ class Model(six.with_metaclass(InitContextMeta, Context, Factor)):
         return FastPointFunc(f)
 
     def profile(self, outs, n=1000, point=None, profile=True, *args, **kwargs):
-        """Compiles and profiles a Theano function which returns `outs` and
+        """Compiles and profiles a Theano function which returns ``outs`` and
         takes values of model vars as a dict as an argument.
 
         Parameters
@@ -895,7 +955,7 @@ class Model(six.with_metaclass(InitContextMeta, Context, Factor)):
         point : point
             Point to pass to the function
         profile : True or ProfileStats
-        *args, **kwargs
+        args, kwargs
             Compilation args
 
         Returns
@@ -914,10 +974,11 @@ class Model(six.with_metaclass(InitContextMeta, Context, Factor)):
 
     def flatten(self, vars=None, order=None, inputvar=None):
         """Flattens model's input and returns:
-            FlatView with
+
+        FlatView with
             * input vector variable
-            * replacements `input_var -> vars`
-            * view {variable: VarMap}
+            * replacements ``input_var -> vars``
+            * view `{variable: VarMap}`
 
         Parameters
         ----------
@@ -949,17 +1010,45 @@ class Model(six.with_metaclass(InitContextMeta, Context, Factor)):
         flat_view = FlatView(inputvar, replacements, view)
         return flat_view
 
+    def check_test_point(self, test_point=None, round_vals=2):
+        """Checks log probability of test_point for all random variables in the model.
+
+        Parameters
+        ----------
+        test_point : Point
+            Point to be evaluated.
+            if None, then all model.test_point is used
+        round_vals : int
+            Number of decimals to round log-probabilities
+
+        Returns
+        -------
+        Pandas Series
+        """
+        if test_point is None:
+            test_point = self.test_point
+
+        return Series({RV.name:np.round(RV.logp(self.test_point), round_vals) for RV in self.basic_RVs},
+            name='Log-probability of test_point')
+
     def _repr_latex_(self, name=None, dist=None):
         tex_vars = []
         for rv in itertools.chain(self.unobserved_RVs, self.observed_RVs):
-            tex_vars.append(rv.__latex__())
-        return u'$${}$$'.format('\\\\'.join([tex.strip('$') for tex in tex_vars if tex is not None]))
+            rv_tex = rv.__latex__()
+            if rv_tex is not None:
+                array_rv = rv_tex.replace(r'\sim', r'&\sim &').strip('$')
+                tex_vars.append(array_rv)
+        return r'''$$
+            \begin{{array}}{{rcl}}
+            {}
+            \end{{array}}
+            $$'''.format('\\\\'.join(tex_vars))
 
     __latex__ = _repr_latex_
 
 
 def fn(outs, mode=None, model=None, *args, **kwargs):
-    """Compiles a Theano function which returns the values of `outs` and
+    """Compiles a Theano function which returns the values of ``outs`` and
     takes values of model vars as arguments.
 
     Parameters
@@ -976,7 +1065,7 @@ def fn(outs, mode=None, model=None, *args, **kwargs):
 
 
 def fastfn(outs, mode=None, model=None):
-    """Compiles a Theano function which returns `outs` and takes values of model
+    """Compiles a Theano function which returns ``outs`` and takes values of model
     vars as a dict as an argument.
 
     Parameters
@@ -998,7 +1087,7 @@ def Point(*args, **kwargs):
 
     Parameters
     ----------
-    *args, **kwargs
+    args, kwargs
         arguments to build a dict
     """
     model = modelcontext(kwargs.pop('model', None))
@@ -1012,7 +1101,7 @@ def Point(*args, **kwargs):
                 if str(k) in map(str, model.vars))
 
 
-class FastPointFunc(object):
+class FastPointFunc:
     """Wraps so a function so it takes a dict of arguments instead of arguments."""
 
     def __init__(self, f):
@@ -1022,7 +1111,7 @@ class FastPointFunc(object):
         return self.f(**state)
 
 
-class LoosePointFunc(object):
+class LoosePointFunc:
     """Wraps so a function so it takes a dict of arguments instead of arguments
     but can still take arguments."""
 
@@ -1054,13 +1143,13 @@ def _get_scaling(total_size, shape, ndim):
     scalar
     """
     if total_size is None:
-        coef = pm.floatX(1)
+        coef = floatX(1)
     elif isinstance(total_size, int):
         if ndim >= 1:
             denom = shape[0]
         else:
             denom = 1
-        coef = pm.floatX(total_size) / pm.floatX(denom)
+        coef = floatX(total_size) / floatX(denom)
     elif isinstance(total_size, (list, tuple)):
         if not all(isinstance(i, int) for i in total_size if (i is not Ellipsis and i is not None)):
             raise TypeError('Unrecognized `total_size` type, expected '
@@ -1078,20 +1167,20 @@ def _get_scaling(total_size, shape, ndim):
             raise ValueError('Length of `total_size` is too big, '
                              'number of scalings is bigger that ndim, got %r' % total_size)
         elif (len(begin) + len(end)) == 0:
-            return pm.floatX(1)
+            return floatX(1)
         if len(end) > 0:
             shp_end = shape[-len(end):]
         else:
             shp_end = np.asarray([])
         shp_begin = shape[:len(begin)]
-        begin_coef = [pm.floatX(t) / shp_begin[i] for i, t in enumerate(begin) if t is not None]
-        end_coef = [pm.floatX(t) / shp_end[i] for i, t in enumerate(end) if t is not None]
+        begin_coef = [floatX(t) / shp_begin[i] for i, t in enumerate(begin) if t is not None]
+        end_coef = [floatX(t) / shp_end[i] for i, t in enumerate(end) if t is not None]
         coefs = begin_coef + end_coef
         coef = tt.prod(coefs)
     else:
         raise TypeError('Unrecognized `total_size` type, expected '
                         'int or list of ints, got %r' % total_size)
-    return tt.as_tensor(pm.floatX(coef))
+    return tt.as_tensor(floatX(coef))
 
 
 class FreeRV(Factor, TensorVariable):
@@ -1112,7 +1201,7 @@ class FreeRV(Factor, TensorVariable):
         """
         if type is None:
             type = distribution.type
-        super(FreeRV, self).__init__(type, owner, index, name)
+        super().__init__(type, owner, index, name)
 
         if distribution is not None:
             self.dshape = tuple(distribution.shape)
@@ -1140,7 +1229,7 @@ class FreeRV(Factor, TensorVariable):
             name = self.name
         if dist is None:
             dist = self.distribution
-        return self.distribution._repr_latex_(name=escape_latex(name), dist=dist)
+        return self.distribution._repr_latex_(name=name, dist=dist)
 
     __latex__ = _repr_latex_
 
@@ -1166,7 +1255,7 @@ def pandas_to_array(data):
         ret = generator(data)
     else:
         ret = np.asarray(data)
-    return pm.smartfloatX(ret)
+    return pm.floatX(ret)
 
 
 def as_tensor(data, name, model, distribution):
@@ -1174,6 +1263,10 @@ def as_tensor(data, name, model, distribution):
     data = pandas_to_array(data).astype(dtype)
 
     if hasattr(data, 'mask'):
+        impute_message = ('Data in {name} contains missing values and'
+                          ' will be automatically imputed from the'
+                          ' sampling distribution.'.format(name=name))
+        warnings.warn(impute_message, UserWarning)
         from .distributions import NoDistribution
         testval = np.broadcast_to(distribution.default(), data.shape)[data.mask]
         fakedist = NoDistribution.dist(shape=data.mask.sum(), dtype=dtype,
@@ -1215,13 +1308,17 @@ class ObservedRV(Factor, TensorVariable):
             needed for upscaling logp
         """
         from .distributions import TensorType
+
+        if hasattr(data, 'type') and isinstance(data.type, tt.TensorType):
+            type = data.type
+
         if type is None:
             data = pandas_to_array(data)
             type = TensorType(distribution.dtype, data.shape)
 
         self.observations = data
 
-        super(ObservedRV, self).__init__(type, owner, index, name)
+        super().__init__(type, owner, index, name)
 
         if distribution is not None:
             data = as_tensor(data, name, model, distribution)
@@ -1249,7 +1346,7 @@ class ObservedRV(Factor, TensorVariable):
             name = self.name
         if dist is None:
             dist = self.distribution
-        return self.distribution._repr_latex_(name=escape_latex(name), dist=dist)
+        return self.distribution._repr_latex_(name=name, dist=dist)
 
     __latex__ = _repr_latex_
 
@@ -1292,6 +1389,16 @@ class MultiObservedRV(Factor):
         self.distribution = distribution
         self.scaling = _get_scaling(total_size, self.logp_elemwiset.shape, self.logp_elemwiset.ndim)
 
+    # Make hashable by id for draw_values
+    def __hash__(self):
+        return id(self)
+
+    def __eq__(self, other):
+        return self.id == other.id
+
+    def __ne__(self, other):
+        return not self == other
+
 
 def _walk_up_rv(rv):
     """Walk up theano graph to get inputs for deterministic RV."""
@@ -1302,7 +1409,7 @@ def _walk_up_rv(rv):
             all_rvs.extend(_walk_up_rv(parent))
     else:
         if rv.name:
-            all_rvs.append(rv.name)
+            all_rvs.append(r'\text{%s}' % rv.name)
         else:
             all_rvs.append(r'\text{Constant}')
     return all_rvs
@@ -1310,7 +1417,7 @@ def _walk_up_rv(rv):
 
 def _latex_repr_rv(rv):
     """Make latex string for a Deterministic variable"""
-    return r'${} \sim \text{{Deterministic}}({})$'.format(rv.name, r', '.join(_walk_up_rv(rv)))
+    return r'$\text{%s} \sim \text{Deterministic}(%s)$' % (rv.name, r',~'.join(_walk_up_rv(rv)))
 
 
 def Deterministic(name, var, model=None):
@@ -1326,7 +1433,7 @@ def Deterministic(name, var, model=None):
     var : var, with name attribute
     """
     model = modelcontext(model)
-    var.name = model.name_for(name)
+    var = var.copy(model.name_for(name))
     model.deterministics.append(var)
     model.add_random_variable(var)
     var._repr_latex_ = functools.partial(_latex_repr_rv, var)
@@ -1354,31 +1461,33 @@ def Potential(name, var, model=None):
 
 
 class TransformedRV(TensorVariable):
+    """
+    Parameters
+    ----------
+
+    type : theano type (optional)
+    owner : theano owner (optional)
+    name : str
+    distribution : Distribution
+    model : Model
+    total_size : scalar Tensor (optional)
+        needed for upscaling logp
+    """
 
     def __init__(self, type=None, owner=None, index=None, name=None,
                  distribution=None, model=None, transform=None,
                  total_size=None):
-        """
-        Parameters
-        ----------
-
-        type : theano type (optional)
-        owner : theano owner (optional)
-        name : str
-        distribution : Distribution
-        model : Model
-        total_size : scalar Tensor (optional)
-            needed for upscaling logp
-        """
         if type is None:
             type = distribution.type
-        super(TransformedRV, self).__init__(type, owner, index, name)
+        super().__init__(type, owner, index, name)
 
         self.transformation = transform
 
         if distribution is not None:
             self.model = model
             self.distribution = distribution
+            self.dshape = tuple(distribution.shape)
+            self.dsize = int(np.prod(distribution.shape))
 
             transformed_name = get_transformed_name(name, transform)
 
@@ -1402,7 +1511,7 @@ class TransformedRV(TensorVariable):
             name = self.name
         if dist is None:
             dist = self.distribution
-        return self.distribution._repr_latex_(name=escape_latex(name), dist=dist)
+        return self.distribution._repr_latex_(name=name, dist=dist)
 
     __latex__ = _repr_latex_
 
@@ -1420,8 +1529,8 @@ def as_iterargs(data):
 
 
 def all_continuous(vars):
-    """Check that vars not include discrete variables, excepting ObservedRVs.
-    """
+    """Check that vars not include discrete variables, excepting
+    ObservedRVs.  """
     vars_ = [var for var in vars if not isinstance(var, pm.model.ObservedRV)]
     if any([var.dtype in pm.discrete_types for var in vars_]):
         return False

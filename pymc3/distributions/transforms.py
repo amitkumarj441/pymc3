@@ -7,12 +7,14 @@ from . import distribution
 from ..math import logit, invlogit
 from .distribution import draw_values
 import numpy as np
+from scipy.special import logit as nplogit
 
 __all__ = ['transform', 'stick_breaking', 'logodds', 'interval', 'log_exp_m1',
-           'lowerbound', 'upperbound', 'log', 'sum_to_1', 't_stick_breaking']
+           'lowerbound', 'upperbound', 'ordered', 'log', 'sum_to_1',
+           't_stick_breaking']
 
 
-class Transform(object):
+class Transform:
     """A transformation of a random variable from one space into another.
 
     Attributes
@@ -22,15 +24,70 @@ class Transform(object):
     name = ""
 
     def forward(self, x):
+        """Applies transformation forward to input variable `x`.
+        When transform is used on some distribution `p`, it will transform the random variable `x` after sampling
+        from `p`.
+
+        Parameters
+        ----------
+        x : tensor
+            Input tensor to be transformed.
+
+        Returns
+        --------
+        tensor
+            Transformed tensor.
+        """
         raise NotImplementedError
 
     def forward_val(self, x, point):
+        """Applies transformation forward to input array `x`.
+        Similar to `forward` but for constant data.
+
+        Parameters
+        ----------
+        x : array_like
+            Input array to be transformed.
+        point : array_like, optional
+            Test value used to draw (fix) bounds-like transformations
+
+        Returns
+        --------
+        array_like
+            Transformed array.
+        """
         raise NotImplementedError
 
     def backward(self, z):
+        """Applies inverse of transformation to input variable `z`.
+        When transform is used on some distribution `p`, which has observed values `z`, it is used to
+        transform the values of `z` correctly to the support of `p`.
+
+        Parameters
+        ----------
+        z : tensor
+            Input tensor to be inverse transformed.
+
+        Returns
+        -------
+        tensor
+            Inverse transformed tensor.
+        """
         raise NotImplementedError
 
     def jacobian_det(self, x):
+        """Calculates logarithm of the absolute value of the Jacobian determinant for input `x`.
+
+        Parameters
+        ----------
+        x : tensor
+            Input to calculate Jacobian determinant of.
+
+        Returns
+        -------
+        tensor
+            The log abs Jacobian determinant of `x` w.r.t. this transform.
+        """
         raise NotImplementedError
 
     def apply(self, dist):
@@ -68,9 +125,7 @@ class TransformedDistribution(distribution.Distribution):
         v = forward(FreeRV(name='v', distribution=dist))
         self.type = v.type
 
-        super(TransformedDistribution, self).__init__(
-            v.shape.tag.test_value, v.dtype,
-            testval, dist.defaults, *args, **kwargs)
+        super().__init__(v.shape.tag.test_value, v.dtype, testval, dist.defaults, *args, **kwargs)
 
         if transform.name == 'stickbreaking':
             b = np.hstack(((np.atleast_1d(self.shape) == 1)[:-1], False))
@@ -78,8 +133,11 @@ class TransformedDistribution(distribution.Distribution):
             self.type = tt.TensorType(v.dtype, b)
 
     def logp(self, x):
-        return (self.dist.logp(self.transform_used.backward(x)) +
-                self.transform_used.jacobian_det(x))
+        logp_nojac = self.logp_nojac(x)
+        jacobian_det = self.transform_used.jacobian_det(x)
+        if logp_nojac.ndim > jacobian_det.ndim:
+            logp_nojac = logp_nojac.sum(axis=-1)
+        return logp_nojac + jacobian_det
 
     def logp_nojac(self, x):
         return self.dist.logp(self.transform_used.backward(x))
@@ -97,7 +155,7 @@ class Log(ElemwiseTransform):
         return tt.log(x)
 
     def forward_val(self, x, point=None):
-        return self.forward(x)
+        return np.log(x)
 
     def jacobian_det(self, x):
         return x
@@ -107,20 +165,20 @@ log = Log()
 
 class LogExpM1(ElemwiseTransform):
     name = "log_exp_m1"
-    
+
     def backward(self, x):
         return tt.nnet.softplus(x)
-    
+
     def forward(self, x):
         """Inverse operation of softplus
-        y = Log(Exp(x) - 1) 
+        y = Log(Exp(x) - 1)
           = Log(1 - Exp(-x)) + x
         """
         return tt.log(1.-tt.exp(-x)) + x
-    
+
     def forward_val(self, x, point=None):
-        return self.forward(x)
-    
+        return np.log(1.-np.exp(-x)) + x
+
     def jacobian_det(self, x):
         return -tt.nnet.softplus(-x)
 
@@ -137,7 +195,7 @@ class LogOdds(ElemwiseTransform):
         return logit(x)
 
     def forward_val(self, x, point=None):
-        return self.forward(x)
+        return nplogit(x)
 
 logodds = LogOdds()
 
@@ -166,7 +224,7 @@ class Interval(ElemwiseTransform):
         # For an explanation see pull/2328#issuecomment-309303811
         a, b = draw_values([self.a-0., self.b-0.],
                             point=point)
-        return floatX(tt.log(x - a) - tt.log(b - x))
+        return floatX(np.log(x - a) - np.log(b - x))
 
     def jacobian_det(self, x):
         s = tt.nnet.softplus(-x)
@@ -198,7 +256,7 @@ class LowerBound(ElemwiseTransform):
         # For an explanation see pull/2328#issuecomment-309303811
         a = draw_values([self.a-0.],
                         point=point)[0]
-        return floatX(tt.log(x - a))
+        return floatX(np.log(x - a))
 
     def jacobian_det(self, x):
         return x
@@ -229,7 +287,7 @@ class UpperBound(ElemwiseTransform):
         # For an explanation see pull/2328#issuecomment-309303811
         b = draw_values([self.b-0.],
                         point=point)[0]
-        return floatX(tt.log(b - x))
+        return floatX(np.log(b - x))
 
     def jacobian_det(self, x):
         return x
@@ -237,28 +295,60 @@ class UpperBound(ElemwiseTransform):
 upperbound = UpperBound
 
 
+class Ordered(Transform):
+    name = "ordered"
+
+    def backward(self, y):
+        x = tt.zeros(y.shape)
+        x = tt.inc_subtensor(x[..., 0], y[..., 0])
+        x = tt.inc_subtensor(x[..., 1:], tt.exp(y[..., 1:]))
+        return tt.cumsum(x, axis=-1)
+
+    def forward(self, x):
+        y = tt.zeros(x.shape)
+        y = tt.inc_subtensor(y[..., 0], x[..., 0])
+        y = tt.inc_subtensor(y[..., 1:], tt.log(x[..., 1:] - x[..., :-1]))
+        return y
+
+    def forward_val(self, x, point=None):
+        y = np.zeros_like(x)
+        y[..., 0] = x[..., 0]
+        y[..., 1:] = np.log(x[..., 1:] - x[..., :-1])
+        return y
+
+    def jacobian_det(self, y):
+        return tt.sum(y[..., 1:], axis=-1)
+
+ordered = Ordered()
+
+
 class SumTo1(Transform):
-    """Transforms K dimensional simplex space (values in [0,1] and sum to 1) to K - 1 vector of values in [0,1]
+    """
+    Transforms K dimensional simplex space (values in [0,1] and sum to 1) to K - 1 vector of values in [0,1]
+    This Transformation operates on the last dimension of the input tensor.
     """
     name = "sumto1"
 
     def backward(self, y):
-        return tt.concatenate([y, 1 - tt.sum(y, keepdims=True)])
+        remaining = 1 - tt.sum(y[..., :], axis=-1, keepdims=True)
+        return tt.concatenate([y[..., :], remaining], axis=-1)
 
     def forward(self, x):
-        return x[:-1]
+        return x[..., :-1]
 
     def forward_val(self, x, point=None):
-        return self.forward(x)
+        return x[..., :-1]
 
     def jacobian_det(self, x):
-        return 0
+        y = tt.zeros(x.shape)
+        return tt.sum(y, axis=-1)
 
 sum_to_1 = SumTo1()
 
 
 class StickBreaking(Transform):
-    """Transforms K dimensional simplex space (values in [0,1] and sum to 1) to K - 1 vector of real values.
+    """
+    Transforms K dimensional simplex space (values in [0,1] and sum to 1) to K - 1 vector of real values.
     Primarily borrowed from the STAN implementation.
 
     Parameters
@@ -284,8 +374,17 @@ class StickBreaking(Transform):
         y = logit(z) - eq_share
         return floatX(y.T)
 
-    def forward_val(self, x, point=None):
-        return self.forward(x)
+    def forward_val(self, x_, point=None):
+        x = x_.T
+        # reverse cumsum
+        x0 = x[:-1]
+        s = np.cumsum(x0[::-1], 0)[::-1] + x[-1]
+        z = x0 / s
+        Km1 = x.shape[0] - 1
+        k = np.arange(Km1)[(slice(None),) + (None,) * (x.ndim - 1)]
+        eq_share = nplogit(1. / (Km1 + 1 - k).astype(str(x_.dtype)))
+        y = nplogit(z) - eq_share
+        return floatX(y.T)
 
     def backward(self, y_):
         y = y_.T
@@ -314,7 +413,7 @@ stick_breaking = StickBreaking()
 t_stick_breaking = lambda eps: StickBreaking(eps)
 
 
-class Circular(Transform):
+class Circular(ElemwiseTransform):
     """Transforms a linear space into a circular one.
     """
     name = "circular"
@@ -326,16 +425,16 @@ class Circular(Transform):
         return tt.as_tensor_variable(x)
 
     def forward_val(self, x, point=None):
-        return self.forward(x)
+        return x
 
     def jacobian_det(self, x):
-        return 0
+        return tt.zeros(x.shape)
 
 circular = Circular()
 
 
 class CholeskyCovPacked(Transform):
-    name = "cholesky_cov_packed"
+    name = "cholesky-cov-packed"
 
     def __init__(self, n):
         self.diag_idxs = np.arange(1, n + 1).cumsum() - 1
@@ -346,8 +445,51 @@ class CholeskyCovPacked(Transform):
     def forward(self, y):
         return tt.advanced_set_subtensor1(y, tt.log(y[self.diag_idxs]), self.diag_idxs)
 
-    def forward_val(self, x, point=None):
-        return self.forward(x)
+    def forward_val(self, y, point=None):
+        y[..., self.diag_idxs] = np.log(y[..., self.diag_idxs])
+        return y
 
     def jacobian_det(self, y):
         return tt.sum(y[self.diag_idxs])
+
+
+class Chain(Transform):
+    def __init__(self, transform_list):
+        self.transform_list = transform_list
+        self.name = '+'.join([transf.name for transf in self.transform_list])
+
+    def forward(self, x):
+        y = x
+        for transf in self.transform_list:
+            y = transf.forward(y)
+        return y
+
+    def forward_val(self, x, point=None):
+        y = x
+        for transf in self.transform_list:
+            y = transf.forward_val(y)
+        return y
+
+    def backward(self, y):
+        x = y
+        for transf in reversed(self.transform_list):
+            x = transf.backward(x)
+        return x
+
+    def jacobian_det(self, y):
+        y = tt.as_tensor_variable(y)
+        det_list = []
+        ndim0 = y.ndim
+        for transf in reversed(self.transform_list):
+            det_ = transf.jacobian_det(y)
+            det_list.append(det_)
+            y = transf.backward(y)
+            ndim0 = min(ndim0, det_.ndim)
+        # match the shape of the smallest jacobian_det
+        det = 0.
+        for det_ in det_list:
+            if det_.ndim > ndim0:
+                det += det_.sum(axis=-1)
+            else:
+                det += det_
+        return det

@@ -4,19 +4,23 @@ See the docstring for pymc3.backends for more information (including
 creating custom backends).
 """
 import itertools as itl
+import logging
 
 import numpy as np
 import warnings
 import theano.tensor as tt
 
 from ..model import modelcontext
+from .report import SamplerReport, merge_reports
+
+logger = logging.getLogger('pymc3')
 
 
 class BackendError(Exception):
     pass
 
 
-class BaseTrace(object):
+class BaseTrace:
     """Base trace object
 
     Parameters
@@ -61,6 +65,10 @@ class BaseTrace(object):
         self.chain = None
         self._is_base_setup = False
         self.sampler_vars = None
+        self._warnings = []
+
+    def _add_warnings(self, warnings):
+        self._warnings.extend(warnings)
 
     # Sampling methods
 
@@ -69,7 +77,7 @@ class BaseTrace(object):
             raise ValueError("Backend does not support sampler stats.")
 
         if self._is_base_setup and self.sampler_vars != sampler_vars:
-                raise ValueError("Can't change sampler_vars")
+            raise ValueError("Can't change sampler_vars")
 
         if sampler_vars is None:
             self.sampler_vars = None
@@ -174,7 +182,7 @@ class BaseTrace(object):
             return self._get_sampler_stats(varname, sampler_idx, burn, thin)
 
         sampler_idxs = [i for i, s in enumerate(self.sampler_vars)
-                       if varname in s]
+                        if varname in s]
         if not sampler_idxs:
             raise KeyError("Unknown sampler stat %s" % varname)
 
@@ -185,20 +193,19 @@ class BaseTrace(object):
         else:
             return vals
 
-
     def _get_sampler_stats(self, varname, sampler_idx, burn, thin):
         """Get sampler statistics."""
         raise NotImplementedError()
 
     def _slice(self, idx):
         """Slice trace object."""
-        raise NotImplementedError
+        raise NotImplementedError()
 
     def point(self, idx):
         """Return dictionary of point values at `idx` for current chain
         with variables names as keys.
         """
-        raise NotImplementedError
+        raise NotImplementedError()
 
     @property
     def stat_names(self):
@@ -211,7 +218,7 @@ class BaseTrace(object):
             return set()
 
 
-class MultiTrace(object):
+class MultiTrace:
     """Main interface for accessing values from MCMC results
 
     The core method to select values is `get_values`. The method
@@ -258,6 +265,11 @@ class MultiTrace(object):
                 raise ValueError("Chains are not unique.")
             self._straces[strace.chain] = strace
 
+        self._report = SamplerReport()
+        for strace in straces:
+            if hasattr(strace, '_warnings'):
+                self._report._add_warnings(strace._warnings, strace.chain)
+
     def __repr__(self):
         template = '<{}: {} chains, {} iterations, {} variables>'
         return template.format(self.__class__.__name__,
@@ -270,6 +282,10 @@ class MultiTrace(object):
     @property
     def chains(self):
         return list(sorted(self._straces.keys()))
+
+    @property
+    def report(self):
+        return self._report
 
     def __getitem__(self, idx):
         if isinstance(idx, slice):
@@ -295,15 +311,15 @@ class MultiTrace(object):
         if var in self.varnames:
             if var in self.stat_names:
                 warnings.warn("Attribute access on a trace object is ambigous. "
-                "Sampler statistic and model variable share a name. Use "
-                "trace.get_values or trace.get_sampler_stats.")
+                              "Sampler statistic and model variable share a name. Use "
+                              "trace.get_values or trace.get_sampler_stats.")
             return self.get_values(var, burn=burn, thin=thin)
         if var in self.stat_names:
             return self.get_sampler_stats(var, burn=burn, thin=thin)
         raise KeyError("Unknown variable %s" % var)
 
     _attrs = set(['_straces', 'varnames', 'chains', 'stat_names',
-                  'supports_sampler_stats'])
+                  'supports_sampler_stats', '_report'])
 
     def __getattr__(self, name):
         # Avoid infinite recursion when called before __init__
@@ -315,8 +331,8 @@ class MultiTrace(object):
         if name in self.varnames:
             if name in self.stat_names:
                 warnings.warn("Attribute access on a trace object is ambigous. "
-                "Sampler statistic and model variable share a name. Use "
-                "trace.get_values or trace.get_sampler_stats.")
+                              "Sampler statistic and model variable share a name. Use "
+                              "trace.get_values or trace.get_sampler_stats.")
             return self.get_values(name)
         if name in self.stat_names:
             return self.get_sampler_stats(name)
@@ -347,20 +363,28 @@ class MultiTrace(object):
                 names.update(vars.keys())
         return names
 
-    def add_values(self, vals):
-        """add values to traces.
+    def add_values(self, vals, overwrite=False):
+        """add variables to traces.
+
         Parameters
         ----------
         vals : dict (str: array-like)
-             The keys should be the names of the new variables. The values are
-             expected to be array-like object.
-             For traces with more than one chain the lenght of each value
-             should match the number of total samples already in the trace
-             (chains * iterations), otherwise a warning is raised.
+             The keys should be the names of the new variables. The values are expected to be
+             array-like object. For traces with more than one chain the length of each value
+             should match the number of total samples already in the trace (chains * iterations),
+             otherwise a warning is raised.
+        overwrite : bool
+            If `False` (default) a ValueError is raised if the variable already exists.
+            Change to `True` to overwrite the values of variables
         """
         for k, v in vals.items():
+            new_var = 1
             if k in self.varnames:
-                raise ValueError("Variable name {} already exists.".format(k))
+                if overwrite:
+                    self.varnames.remove(k)
+                    new_var = 0
+                else:
+                    raise ValueError("Variable name {} already exists.".format(k))
 
             self.varnames.append(k)
 
@@ -368,17 +392,37 @@ class MultiTrace(object):
             l_samples = len(self) * len(self.chains)
             l_v = len(v)
             if l_v != l_samples:
-                warnings.warn("The lenght of the values you are trying to "
+                warnings.warn("The length of the values you are trying to "
                               "add ({}) does not match the number ({}) of "
                               "total samples in the trace "
                               "(chains * iterations)".format(l_v, l_samples))
 
-            v = v.reshape(len(chains), -1)
+            v = np.squeeze(v.reshape(len(chains), len(self), -1))
 
             for idx, chain in enumerate(chains.values()):
+                if new_var:
+                    dummy = tt.as_tensor_variable([], k)
+                    chain.vars.append(dummy)
                 chain.samples[k] = v[idx]
-                dummy = tt.as_tensor_variable([], k)
-                chain.vars.append(dummy)
+
+    def remove_values(self, name):
+        """remove variables from traces.
+
+        Parameters
+        ----------
+        name : str
+            Name of the variable to remove. Raises KeyError if the variable is not present
+        """
+        varnames = self.varnames
+        if name not in varnames:
+            raise KeyError("Unknown variable {}".format(name))
+        self.varnames.remove(name)
+        chains = self._straces
+        for chain in chains.values():
+            for va in chain.vars:
+                if va.name == name:
+                    chain.vars.remove(va)
+                    del chain.samples[name]
 
     def get_values(self, varname, burn=0, thin=1, combine=True, chains=None,
                    squeeze=True):
@@ -447,10 +491,13 @@ class MultiTrace(object):
                    for chain in chains]
         return _squeeze_cat(results, combine, squeeze)
 
-    def _slice(self, idx):
-        """Return a new MultiTrace object sliced according to `idx`."""
-        new_traces = [trace._slice(idx) for trace in self._straces.values()]
-        return MultiTrace(new_traces)
+    def _slice(self, slice):
+        """Return a new MultiTrace object sliced according to `slice`."""
+        new_traces = [trace._slice(slice) for trace in self._straces.values()]
+        trace = MultiTrace(new_traces)
+        idxs = slice.indices(len(self))
+        trace._report = self._report._slice(*idxs)
+        return trace
 
     def point(self, idx, chain=None):
         """Return a dictionary of point values at `idx`.
@@ -502,6 +549,7 @@ def merge_traces(mtraces):
             if new_chain in base_mtrace._straces:
                 raise ValueError("Chains are not unique.")
             base_mtrace._straces[new_chain] = strace
+    base_mtrace.report = merge_reports([trace.report for trace in mtraces])
     return base_mtrace
 
 

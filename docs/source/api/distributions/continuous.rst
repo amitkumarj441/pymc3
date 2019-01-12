@@ -12,6 +12,7 @@ Continuous
    HalfNormal
    SkewNormal
    Beta
+   Kumaraswamy
    Exponential
    Laplace
    StudentT
@@ -29,6 +30,8 @@ Continuous
    VonMises
    Triangular
    Gumbel
+   Logistic
+   LogitNormal
    Interpolated
 
 .. automodule:: pymc3.distributions.continuous

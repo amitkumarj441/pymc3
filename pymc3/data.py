@@ -2,7 +2,7 @@ from copy import copy
 import io
 import os
 import pkgutil
-
+import collections
 import numpy as np
 import pymc3 as pm
 import theano.tensor as tt
@@ -11,7 +11,8 @@ import theano
 __all__ = [
     'get_data',
     'GeneratorAdapter',
-    'Minibatch'
+    'Minibatch',
+    'align_minibatches'
 ]
 
 
@@ -32,7 +33,7 @@ def get_data(filename):
 
 class GenTensorVariable(tt.TensorVariable):
     def __init__(self, op, type, name=None):
-        super(GenTensorVariable, self).__init__(type=type, name=name)
+        super().__init__(type=type, name=name)
         self.op = op
 
     def set_gen(self, gen):
@@ -47,7 +48,7 @@ class GenTensorVariable(tt.TensorVariable):
         return cp
 
 
-class GeneratorAdapter(object):
+class GeneratorAdapter:
     """
     Helper class that helps to infer data type of generator with looking
     at the first item, preserving the order of the resulting generator
@@ -98,7 +99,7 @@ class Minibatch(tt.TensorVariable):
     data : :class:`ndarray`
         initial data
     batch_size : `int` or `List[int|tuple(size, random_seed)]`
-        batch size for inference, random seed is needed 
+        batch size for inference, random seed is needed
         for child random generators
     dtype : `str`
         cast data to specific type
@@ -109,10 +110,10 @@ class Minibatch(tt.TensorVariable):
     random_seed : `int`
         random seed that is used by default
     update_shared_f : `callable`
-        returns :class:`ndarray` that will be carefully 
+        returns :class:`ndarray` that will be carefully
         stored to underlying shared variable
-        you can use it to change source of 
-        minibatches programmatically 
+        you can use it to change source of
+        minibatches programmatically
     in_memory_size : `int` or `List[int|slice|Ellipsis]`
         data size for storing in theano.shared
 
@@ -123,6 +124,14 @@ class Minibatch(tt.TensorVariable):
     minibatch : minibatch tensor
         Used for training
 
+    Notes
+    -----
+    Below is a common use case of Minibatch within the variational inference.
+    Importantly, we need to make PyMC3 "aware" of minibatch being used in inference.
+    Otherwise, we will get the wrong :math:`logp` for the model.
+    To do so, we need to pass the `total_size` parameter to the observed node, which correctly scales
+    the density of the model logp that is affected by Minibatch. See more in examples below.
+
     Examples
     --------
     Consider we have data
@@ -132,7 +141,7 @@ class Minibatch(tt.TensorVariable):
     >>> x = Minibatch(data, batch_size=10)
 
     Note, that your data is cast to `floatX` if it is not integer type
-    But you still can add `dtype` kwarg for :class:`Minibatch` 
+    But you still can add `dtype` kwarg for :class:`Minibatch`
 
     in case we want 10 sampled rows and columns
     `[(size, seed), (size, seed)]` it is
@@ -173,7 +182,7 @@ class Minibatch(tt.TensorVariable):
     >>> x.update_shared()
 
     To be more concrete about how we get minibatch, here is a demo
-    1) create shared variable 
+    1) create shared variable
     >>> shared = theano.shared(data)
 
     2) create random slice of size 10
@@ -182,7 +191,7 @@ class Minibatch(tt.TensorVariable):
     3) take that slice
     >>> minibatch = shared[ridx]
 
-    That's done. Next you can use this minibatch somewhere else. 
+    That's done. Next you can use this minibatch somewhere else.
     You can see that implementation does not require fixed shape
     for shared variable. Feel free to use that if needed.
 
@@ -213,7 +222,7 @@ class Minibatch(tt.TensorVariable):
     We take slice only for the first and last dimension
     >>> assert x.eval().shape == (2, 20, 30, 40, 10)
 
-    2) Skipping particular dimension, `total_size = (10, None, 30)` 
+    2) Skipping particular dimension, `total_size = (10, None, 30)`
     >>> x = Minibatch(moredata, [2, None, 20])
     >>> assert x.eval().shape == (2, 20, 20, 40, 50)
 
@@ -221,6 +230,9 @@ class Minibatch(tt.TensorVariable):
     >>> x = Minibatch(moredata, [2, None, 20, Ellipsis, 10])
     >>> assert x.eval().shape == (2, 20, 20, 40, 10)
     """
+
+    RNG = collections.defaultdict(list)
+
     @theano.configparser.change_flags(compute_test_value='raise')
     def __init__(self, data, batch_size=128, dtype=None, broadcastable=None, name='Minibatch',
                  random_seed=42, update_shared_f=None, in_memory_size=None):
@@ -237,23 +249,26 @@ class Minibatch(tt.TensorVariable):
             broadcastable = (False, ) * minibatch.ndim
         minibatch = tt.patternbroadcast(minibatch, broadcastable)
         self.minibatch = minibatch
-        super(Minibatch, self).__init__(
-            self.minibatch.type, None, None, name=name)
+        super().__init__(self.minibatch.type, None, None, name=name)
         theano.Apply(
             theano.compile.view_op,
             inputs=[self.minibatch], outputs=[self])
         self.tag.test_value = copy(self.minibatch.tag.test_value)
 
-    @staticmethod
-    def rslice(total, size, seed):
+    def rslice(self, total, size, seed):
         if size is None:
             return slice(None)
         elif isinstance(size, int):
-            return (pm.tt_rng(seed)
+            rng = pm.tt_rng(seed)
+            Minibatch.RNG[id(self)].append(rng)
+            return (rng
                     .uniform(size=(size, ), low=0.0, high=pm.floatX(total) - 1e-16)
                     .astype('int64'))
         else:
             raise TypeError('Unrecognized size type, %r' % size)
+
+    def __del__(self):
+        del Minibatch.RNG[id(self)]
 
     @staticmethod
     def make_static_slices(user_size):
@@ -278,12 +293,11 @@ class Minibatch(tt.TensorVariable):
         else:
             raise TypeError('Unrecognized size type, %r' % user_size)
 
-    @classmethod
-    def make_random_slices(cls, in_memory_shape, batch_size, default_random_seed):
+    def make_random_slices(self, in_memory_shape, batch_size, default_random_seed):
         if batch_size is None:
             return [Ellipsis]
         elif isinstance(batch_size, int):
-            slc = [cls.rslice(in_memory_shape[0], batch_size, default_random_seed)]
+            slc = [self.rslice(in_memory_shape[0], batch_size, default_random_seed)]
         elif isinstance(batch_size, (list, tuple)):
             def check(t):
                 if t is Ellipsis or t is None:
@@ -334,14 +348,13 @@ class Minibatch(tt.TensorVariable):
             else:
                 shp_end = np.asarray([])
             shp_begin = shape[:len(begin)]
-            slc_begin = [cls.rslice(shp_begin[i], t[0], t[1])
+            slc_begin = [self.rslice(shp_begin[i], t[0], t[1])
                          if t is not None else tt.arange(shp_begin[i])
                          for i, t in enumerate(begin)]
-            slc_end = [cls.rslice(shp_end[i], t[0], t[1])
+            slc_end = [self.rslice(shp_end[i], t[0], t[1])
                        if t is not None else tt.arange(shp_end[i])
                        for i, t in enumerate(end)]
             slc = slc_begin + mid + slc_end
-            slc = slc
         else:
             raise TypeError('Unrecognized size type, %r' % batch_size)
         return pm.theanof.ix_(*slc)
@@ -359,3 +372,16 @@ class Minibatch(tt.TensorVariable):
         ret.name = self.name
         ret.tag = copy(self.tag)
         return ret
+
+
+def align_minibatches(batches=None):
+    if batches is None:
+        for rngs in Minibatch.RNG.values():
+            for rng in rngs:
+                rng.seed()
+    else:
+        for b in batches:
+            if not isinstance(b, Minibatch):
+                raise TypeError('{b} is not a Minibatch')
+            for rng in Minibatch.RNG[id(b)]:
+                rng.seed()

@@ -14,7 +14,7 @@ def simple_model():
     with Model() as model:
         Normal('x', mu, tau=tau, shape=2, testval=tt.ones(2) * .1)
 
-    return model.test_point, model, (mu, tau ** -1)
+    return model.test_point, model, (mu, tau ** -.5)
 
 
 def simple_categorical():
@@ -34,7 +34,7 @@ def multidimensional_model():
     with Model() as model:
         Normal('x', mu, tau=tau, shape=(3, 2), testval=.1 * tt.ones((3, 2)))
 
-    return model.test_point, model, (mu, tau ** -1)
+    return model.test_point, model, (mu, tau ** -.5)
 
 
 def simple_arbitrary_det():
@@ -170,6 +170,6 @@ def simple_normal(bounded_prior=False):
             mu_i = pm.Uniform("mu_i", a, b)
         else:
             mu_i = pm.Flat("mu_i")
-        pm.Normal("X_obs", mu=mu_i, sd=sd, observed=x0)
+        pm.Normal("X_obs", mu=mu_i, sigma=sd, observed=x0)
 
     return model.test_point, model, None

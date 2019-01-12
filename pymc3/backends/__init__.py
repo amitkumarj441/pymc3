@@ -20,8 +20,12 @@ For example, the following would save the sampling values to CSV files
 in the directory 'test'.
 
     >>> import pymc3 as pm
-    >>> db = pm.backends.Text('test')
-    >>> trace = pm.sample(..., trace=db)
+    >>> with pm.Model():
+    >>>      db = pm.backends.Text('test')
+    >>>      trace = pm.sample(..., trace=db)
+
+Note that as in the example above, one must have an active model context,
+or pass a `model` parameter in order to create a backend.
 
 Selecting values from a backend
 -------------------------------
@@ -34,7 +38,7 @@ backend object with a variable or variable name.
 
 The call will return the sampling values of `x`, with the values for
 all chains concatenated. (For a single call to `sample`, the number of
-chains will correspond to the `njobs` argument.)
+chains will correspond to the `cores` argument.)
 
 To discard the first N values of each chain, slicing syntax can be
 used.
@@ -113,7 +117,7 @@ defined that returns a MultiTrace object.
 
 For specific examples, see pymc3.backends.{ndarray,text,sqlite}.py.
 """
-from ..backends.ndarray import NDArray
+from ..backends.ndarray import NDArray, save_trace, load_trace
 from ..backends.text import Text
 from ..backends.sqlite import SQLite
 from ..backends.hdf5 import HDF5

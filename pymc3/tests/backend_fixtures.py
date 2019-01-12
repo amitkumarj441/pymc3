@@ -10,7 +10,7 @@ import pytest
 import theano
 
 
-class ModelBackendSetupTestCase(object):
+class ModelBackendSetupTestCase:
     """Set up a backend trace.
 
     Provides the attributes
@@ -60,12 +60,16 @@ class ModelBackendSetupTestCase(object):
             self.strace.setup(self.draws, self.chain, self.sampler_vars)
             assert len(self.strace) == 0
 
+    def test_double_close(self):
+        self.strace.close()
+        self.strace.close()
+
     def teardown_method(self):
         if self.name is not None:
             remove_file_or_directory(self.name)
 
 
-class StatsTestCase(object):
+class StatsTestCase:
     """Test for init and setup of backups.
 
     Provides the attributes
@@ -101,7 +105,7 @@ class StatsTestCase(object):
             remove_file_or_directory(self.name)
 
 
-class ModelBackendSampledTestCase(object):
+class ModelBackendSampledTestCase:
     """Setup and sample a backend trace.
 
     Provides the attributes
@@ -288,6 +292,7 @@ class SelectionTestCase(ModelBackendSampledTestCase):
     def test_len(self):
         assert len(self.mtrace) == self.draws
 
+    @pytest.mark.xfail(condition=(theano.config.floatX == "float32"), reason="Fails on float32")
     def test_dtypes(self):
         for varname in self.test_point.keys():
             assert self.expected[0][varname].dtype == \
@@ -430,7 +435,7 @@ class DumpLoadTestCase(ModelBackendSampledTestCase):
     """
     @classmethod
     def setup_class(cls):
-        super(DumpLoadTestCase, cls).setup_class()
+        super().setup_class()
         try:
             with cls.model:
                 cls.dumped = cls.load_func(cls.name)
@@ -474,12 +479,12 @@ class BackendEqualityTestCase(ModelBackendSampledTestCase):
     def setup_class(cls):
         cls.backend = cls.backend0
         cls.name = cls.name0
-        super(BackendEqualityTestCase, cls).setup_class()
+        super().setup_class()
         cls.mtrace0 = cls.mtrace
 
         cls.backend = cls.backend1
         cls.name = cls.name1
-        super(BackendEqualityTestCase, cls).setup_class()
+        super().setup_class()
         cls.mtrace1 = cls.mtrace
 
     @classmethod
@@ -492,6 +497,7 @@ class BackendEqualityTestCase(ModelBackendSampledTestCase):
         assert self.mtrace0.nchains == self.mtrace1.nchains
         assert len(self.mtrace0) == len(self.mtrace1)
 
+    @pytest.mark.xfail(condition=(theano.config.floatX == "float32"), reason="Fails on float32")
     def test_dtype(self):
         for varname in self.test_point.keys():
             assert self.mtrace0.get_values(varname, chains=0).dtype == \

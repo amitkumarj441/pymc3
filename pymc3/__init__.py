@@ -1,13 +1,13 @@
 # pylint: disable=wildcard-import
-__version__ = "3.2"
+__version__ = "3.6"
 
 from .blocking import *
 from .distributions import *
-from .external import *
 from .glm import *
 from . import gp
 from .math import logaddexp, logsumexp, logit, invlogit, expand_packed_triangular, probit, invprobit
 from .model import *
+from .model_graph import model_to_graphviz
 from .stats import *
 from .sampling import *
 from .step_methods import *
@@ -20,6 +20,7 @@ from . import sampling
 
 from .diagnostics import *
 from .backends.tracetab import *
+from .backends import save_trace, load_trace
 
 from .plots import *
 from .tests import test

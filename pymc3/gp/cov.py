@@ -15,10 +15,13 @@ __all__ = ['Constant',
            'Cosine',
            'Periodic',
            'WarpedInput',
-           'Gibbs']
+           'Gibbs',
+           'Coregion',
+           'ScaledCov',
+           'Kron']
 
 
-class Covariance(object):
+class Covariance:
     R"""
     Base class for all kernels/covariance functions.
 
@@ -102,7 +105,7 @@ class Combination(Covariance):
     def __init__(self, factor_list):
         input_dim = max([factor.input_dim for factor in factor_list
                              if isinstance(factor, Covariance)])
-        super(Combination, self).__init__(input_dim=input_dim)
+        super().__init__(input_dim=input_dim)
         self.factor_list = []
         for factor in factor_list:
             if isinstance(factor, self.__class__):
@@ -143,6 +146,44 @@ class Prod(Combination):
         return reduce(mul, self.merge_factors(X, Xs, diag))
 
 
+class Kron(Covariance):
+    R"""Form a covariance object that is the kronecker product of other covariances.
+
+    In contrast to standard multiplication, where each covariance is given the
+    same inputs X and Xs, kronecker product covariances first split the inputs
+    into their respective spaces (inferred from the input_dim of each object)
+    before forming their product. Kronecker covariances have a larger
+    input dimension than any of its factors since the inputs are the
+    concatenated columns of its components.
+
+    Factors must be covariances or their combinations, arrays will not work.
+
+    Generally utilized by the `gp.MarginalKron` and gp.LatentKron`
+    implementations.
+    """
+
+    def __init__(self, factor_list):
+        self.input_dims = [factor.input_dim for factor in factor_list]
+        input_dim = sum(self.input_dims)
+        super().__init__(input_dim=input_dim)
+        self.factor_list = factor_list
+
+    def _split(self, X, Xs):
+        indices = np.cumsum(self.input_dims)
+        X_split = np.hsplit(X, indices)
+        if Xs is not None:
+            Xs_split = np.hsplit(Xs, indices)
+        else:
+            Xs_split = [None] * len(X_split)
+        return X_split, Xs_split
+
+    def __call__(self, X, Xs=None, diag=False):
+        X_split, Xs_split = self._split(X, Xs)
+        covs = [cov(x, xs, diag) for cov, x, xs
+                in zip(self.factor_list, X_split, Xs_split)]
+        return reduce(mul, covs)
+
+
 class Constant(Covariance):
     R"""
     Constant valued covariance function.
@@ -153,7 +194,7 @@ class Constant(Covariance):
     """
 
     def __init__(self, c):
-        super(Constant, self).__init__(1, None)
+        super().__init__(1, None)
         self.c = c
 
     def diag(self, X):
@@ -176,7 +217,7 @@ class WhiteNoise(Covariance):
     """
 
     def __init__(self, sigma):
-        super(WhiteNoise, self).__init__(1, None)
+        super().__init__(1, None)
         self.sigma = sigma
 
     def diag(self, X):
@@ -201,7 +242,7 @@ class Stationary(Covariance):
     """
 
     def __init__(self, input_dim, ls=None, ls_inv=None, active_dims=None):
-        super(Stationary, self).__init__(input_dim, active_dims)
+        super().__init__(input_dim, active_dims)
         if (ls is None and ls_inv is None) or (ls is not None and ls_inv is not None):
             raise ValueError("Only one of 'ls' or 'ls_inv' must be provided")
         elif ls_inv is not None:
@@ -244,7 +285,7 @@ class Periodic(Stationary):
     """
 
     def __init__(self, input_dim, period, ls=None, ls_inv=None, active_dims=None):
-        super(Periodic, self).__init__(input_dim, ls, ls_inv, active_dims)
+        super().__init__(input_dim, ls, ls_inv, active_dims)
         self.period = period
     def full(self, X, Xs=None):
         X, Xs = self._slice(X, Xs)
@@ -282,7 +323,7 @@ class RatQuad(Stationary):
     """
 
     def __init__(self, input_dim, alpha, ls=None, ls_inv=None, active_dims=None):
-        super(RatQuad, self).__init__(input_dim, ls, ls_inv, active_dims)
+        super().__init__(input_dim, ls, ls_inv, active_dims)
         self.alpha = alpha
 
     def full(self, X, Xs=None):
@@ -361,7 +402,7 @@ class Linear(Covariance):
     """
 
     def __init__(self, input_dim, c, active_dims=None):
-        super(Linear, self).__init__(input_dim, active_dims)
+        super().__init__(input_dim, active_dims)
         self.c = c
 
     def _common(self, X, Xs=None):
@@ -391,16 +432,16 @@ class Polynomial(Linear):
     """
 
     def __init__(self, input_dim, c, d, offset, active_dims=None):
-        super(Polynomial, self).__init__(input_dim, c, active_dims)
+        super().__init__(input_dim, c, active_dims)
         self.d = d
         self.offset = offset
 
     def full(self, X, Xs=None):
-        linear = super(Polynomial, self).full(X, Xs)
+        linear = super().full(X, Xs)
         return tt.power(linear + self.offset, self.d)
 
     def diag(self, X):
-        linear = super(Polynomial, self).diag(X)
+        linear = super().diag(X)
         return tt.power(linear + self.offset, self.d)
 
 
@@ -423,7 +464,7 @@ class WarpedInput(Covariance):
 
     def __init__(self, input_dim, cov_func, warp_func, args=None,
                  active_dims=None):
-        super(WarpedInput, self).__init__(input_dim, active_dims)
+        super().__init__(input_dim, active_dims)
         if not callable(warp_func):
             raise TypeError("warp_func must be callable")
         if not isinstance(cov_func, Covariance):
@@ -464,7 +505,7 @@ class Gibbs(Covariance):
 
     def __init__(self, input_dim, lengthscale_func, args=None,
                  active_dims=None):
-        super(Gibbs, self).__init__(input_dim, active_dims)
+        super().__init__(input_dim, active_dims)
         if active_dims is not None:
             if len(active_dims) > 1:
                 raise NotImplementedError(("Higher dimensional inputs ",
@@ -486,18 +527,17 @@ class Gibbs(Covariance):
         else:
             Xs2 = tt.sum(tt.square(Xs), 1)
             sqd = (-2.0 * tt.dot(X, tt.transpose(Xs))
-                   + (tt.reshape(Xs2, (-1, 1)) + tt.reshape(Xs2, (1, -1))))
+                   + (tt.reshape(X2, (-1, 1)) + tt.reshape(Xs2, (1, -1))))
         return tt.clip(sqd, 0.0, np.inf)
 
     def full(self, X, Xs=None):
+        X, Xs = self._slice(X, Xs)
         rx = self.lfunc(tt.as_tensor_variable(X), self.args)
         if Xs is None:
             rz = self.lfunc(tt.as_tensor_variable(X), self.args)
-            X, Xs = self._slice(X, Xs)
             r2 = self.square_dist(X, X)
         else:
             rz = self.lfunc(tt.as_tensor_variable(Xs), self.args)
-            X, Xs = self._slice(X, Xs)
             r2 = self.square_dist(X, Xs)
         rx2 = tt.reshape(tt.square(rx), (-1, 1))
         rz2 = tt.reshape(tt.square(rz), (1, -1))
@@ -506,6 +546,115 @@ class Gibbs(Covariance):
 
     def diag(self, X):
         return tt.alloc(1.0, X.shape[0])
+
+
+class ScaledCov(Covariance):
+    R"""
+    Construct a kernel by multiplying a base kernel with a scaling
+    function defined using Theano.  The scaling function is
+    non-negative, and can be parameterized.
+
+    .. math::
+       k(x, x') = \phi(x) k_{\text{base}}(x, x') \phi(x')
+
+    Parameters
+    ----------
+    cov_func: Covariance
+        Base kernel or covariance function
+    scaling_func : callable
+        Theano function of X and additional optional arguments.
+    args : optional, tuple or list of scalars or PyMC3 variables
+        Additional inputs (besides X or Xs) to lengthscale_func.
+    """
+    def __init__(self, input_dim, cov_func, scaling_func, args=None, active_dims=None):
+        super().__init__(input_dim, active_dims)
+        if not callable(scaling_func):
+            raise TypeError("scaling_func must be callable")
+        if not isinstance(cov_func, Covariance):
+            raise TypeError("Must be or inherit from the Covariance class")
+        self.cov_func = cov_func
+        self.scaling_func = handle_args(scaling_func, args)
+        self.args = args
+
+    def diag(self, X):
+        X, _ = self._slice(X, None)
+        cov_diag = self.cov_func(X, diag=True)
+        scf_diag = tt.square(tt.flatten(self.scaling_func(X, self.args)))
+        return cov_diag * scf_diag
+
+    def full(self, X, Xs=None):
+        X, Xs = self._slice(X, Xs)
+        scf_x = self.scaling_func(X, self.args)
+        if Xs is None:
+            return tt.outer(scf_x, scf_x) * self.cov_func(X)
+        else:
+            scf_xs = self.scaling_func(Xs, self.args)
+            return tt.outer(scf_x, scf_xs) * self.cov_func(X, Xs)
+
+
+class Coregion(Covariance):
+    R"""Covariance function for intrinsic/linear coregionalization models.
+    Adapted from GPy http://gpy.readthedocs.io/en/deploy/GPy.kern.src.html#GPy.kern.src.coregionalize.Coregionalize.
+
+    This covariance has the form:
+
+    .. math::
+
+       \mathbf{B} = \mathbf{W}\mathbf{W}^\top + \text{diag}(\kappa)
+
+    and calls must use integers associated with the index of the matrix.
+    This allows the api to remain consistent with other covariance objects:
+
+    .. math::
+
+        k(x, x') = \mathbf{B}[x, x'^\top]
+
+    Parameters
+    ----------
+    W : 2D array of shape (num_outputs, rank)
+        a low rank matrix that determines the correlations between
+        the different outputs (rows)
+    kappa : 1D array of shape (num_outputs, )
+        a vector which allows the outputs to behave independently
+    B : 2D array of shape (num_outputs, rank)
+        the total matrix, exactly one of (W, kappa) and B must be provided
+
+    Notes
+    -----
+    Exactly one dimension must be active for this kernel. Thus, if
+    `input_dim != 1`, then `active_dims` must have a length of one.
+    """
+
+    def __init__(self, input_dim, W=None, kappa=None, B=None, active_dims=None):
+        super().__init__(input_dim, active_dims)
+        if len(self.active_dims) != 1:
+            raise ValueError('Coregion requires exactly one dimension to be active')
+        make_B = W is not None or kappa is not None
+        if make_B and B is not None:
+            raise ValueError('Exactly one of (W, kappa) and B must be provided to Coregion')
+        if make_B:
+            self.W = tt.as_tensor_variable(W)
+            self.kappa = tt.as_tensor_variable(kappa)
+            self.B = tt.dot(self.W, self.W.T) + tt.diag(self.kappa)
+        elif B is not None:
+            self.B = tt.as_tensor_variable(B)
+        else:
+            raise ValueError('Exactly one of (W, kappa) and B must be provided to Coregion')
+
+    def full(self, X, Xs=None):
+        X, Xs = self._slice(X, Xs)
+        index = tt.cast(X, 'int32')
+        if Xs is None:
+            index2 = index.T
+        else:
+            index2 = tt.cast(Xs, 'int32').T
+        return self.B[index, index2]
+
+    def diag(self, X):
+        X, _ = self._slice(X, None)
+        index = tt.cast(X, 'int32')
+        return tt.diag(self.B)[index.ravel()]
+
 
 def handle_args(func, args):
     def f(x, args):
@@ -516,3 +665,5 @@ def handle_args(func, args):
                 args = (args,)
             return func(x, *args)
     return f
+
+

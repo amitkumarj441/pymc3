@@ -6,12 +6,14 @@ import pymc3 as pm
 from .helpers import SeededTest
 from ..tests import backend_fixtures as bf
 from ..backends import ndarray
-from ..stats import summary, autocorr, hpd, mc_error, quantiles, make_indices, bfmi
+from ..stats import (summary, autocorr, autocov, hpd, mc_error, quantiles,
+                     make_indices, bfmi, r2_score)
 from ..theanof import floatX_array
 import pymc3.stats as pmstats
 from numpy.random import random, normal
 from numpy.testing import assert_equal, assert_almost_equal, assert_array_almost_equal
 from scipy import stats as st
+import copy
 
 
 def test_log_post_trace():
@@ -53,12 +55,12 @@ def test_compare():
 
     with pm.Model() as model0:
         mu = pm.Normal('mu', 0, 1)
-        x = pm.Normal('x', mu=mu, sd=1, observed=x_obs)
+        x = pm.Normal('x', mu=mu, sigma=1, observed=x_obs)
         trace0 = pm.sample(1000)
 
     with pm.Model() as model1:
         mu = pm.Normal('mu', 0, 1)
-        x = pm.Normal('x', mu=mu, sd=0.8, observed=x_obs)
+        x = pm.Normal('x', mu=mu, sigma=0.8, observed=x_obs)
         trace1 = pm.sample(1000)
 
     with pm.Model() as model2:
@@ -66,12 +68,14 @@ def test_compare():
         x = pm.StudentT('x', nu=1, mu=mu, lam=1, observed=x_obs)
         trace2 = pm.sample(1000)
 
-    traces = [trace0] * 2
-    models = [model0] * 2
+    traces = [trace0, copy.copy(trace0)]
+    models = [model0, copy.copy(model0)]
 
-    w_st = pm.compare(traces, models, method='stacking')['weight']
-    w_bb_bma = pm.compare(traces, models, method='BB-pseudo-BMA')['weight']
-    w_bma = pm.compare(traces, models, method='pseudo-BMA')['weight']
+    model_dict = dict(zip(models, traces))
+
+    w_st = pm.compare(model_dict, method='stacking')['weight']
+    w_bb_bma = pm.compare(model_dict, method='BB-pseudo-BMA')['weight']
+    w_bma = pm.compare(model_dict, method='pseudo-BMA')['weight']
 
     assert_almost_equal(w_st[0], w_st[1])
     assert_almost_equal(w_bb_bma[0], w_bb_bma[1])
@@ -83,9 +87,12 @@ def test_compare():
 
     traces = [trace0, trace1, trace2]
     models = [model0, model1, model2]
-    w_st = pm.compare(traces, models, method='stacking')['weight']
-    w_bb_bma = pm.compare(traces, models, method='BB-pseudo-BMA')['weight']
-    w_bma = pm.compare(traces, models, method='pseudo-BMA')['weight']
+
+    model_dict = dict(zip(models, traces))
+
+    w_st = pm.compare(model_dict, method='stacking')['weight']
+    w_bb_bma = pm.compare(model_dict, method='BB-pseudo-BMA')['weight']
+    w_bma = pm.compare(model_dict, method='pseudo-BMA')['weight']
 
     assert(w_st[0] > w_st[1] > w_st[2])
     assert(w_bb_bma[0] > w_bb_bma[1] > w_bb_bma[2])
@@ -99,57 +106,20 @@ def test_compare():
 class TestStats(SeededTest):
     @classmethod
     def setup_class(cls):
-        super(TestStats, cls).setup_class()
+        super().setup_class()
         cls.normal_sample = normal(0, 1, 200000)
 
     def test_autocorr(self):
         """Test autocorrelation and autocovariance functions"""
-        assert_almost_equal(autocorr(self.normal_sample), 0, 2)
+        assert_almost_equal(autocorr(self.normal_sample)[1], 0, 2)
         y = [(self.normal_sample[i - 1] + self.normal_sample[i]) /
              2 for i in range(1, len(self.normal_sample))]
-        assert_almost_equal(autocorr(y), 0.5, 2)
-
-    def test_dic(self):
-        """Test deviance information criterion calculation"""
-        x_obs = np.arange(6)
-
-        with pm.Model():
-            p = pm.Beta('p', 1., 1., transform=None)
-            pm.Binomial('x', 5, p, observed=x_obs)
-
-            step = pm.Metropolis()
-            trace = pm.sample(100, step, chains=1)
-            calculated = pm.dic(trace)
-
-        mean_deviance = -2 * st.binom.logpmf(
-            np.repeat(np.atleast_2d(x_obs), 100, axis=0),
-            5,
-            np.repeat(np.atleast_2d(trace['p']), 6, axis=0).T).sum(axis=1).mean()
-        deviance_at_mean = -2 * st.binom.logpmf(x_obs, 5, trace['p'].mean()).sum()
-        actual = 2 * mean_deviance - deviance_at_mean
-
-        assert_almost_equal(calculated, actual, decimal=2)
-
-    def test_bpic(self):
-        """Test Bayesian predictive information criterion"""
-        x_obs = np.arange(6)
-
-        with pm.Model():
-            p = pm.Beta('p', 1., 1., transform=None)
-            pm.Binomial('x', 5, p, observed=x_obs)
-
-            step = pm.Metropolis()
-            trace = pm.sample(100, step, chains=1)
-            calculated = pm.bpic(trace)
-
-        mean_deviance = -2 * st.binom.logpmf(
-            np.repeat(np.atleast_2d(x_obs), 100, axis=0),
-            5,
-            np.repeat(np.atleast_2d(trace['p']), 6, axis=0).T).sum(axis=1).mean()
-        deviance_at_mean = -2 * st.binom.logpmf(x_obs, 5, trace['p'].mean()).sum()
-        actual = 3 * mean_deviance - 2 * deviance_at_mean
-
-        assert_almost_equal(calculated, actual, decimal=2)
+        assert_almost_equal(autocorr(np.asarray(y))[1], 0.5, 2)
+        lag = 5
+        acov_np = np.cov(self.normal_sample[:-lag],
+                         self.normal_sample[lag:], bias=1)[0, 1]
+        acov_pm = autocov(self.normal_sample)[lag]
+        assert_almost_equal(acov_pm, acov_np, 7)
 
     def test_waic(self):
         """Test widely available information criterion calculation"""
@@ -276,6 +246,14 @@ class TestStats(SeededTest):
 
         assert_almost_equal(bfmi(trace), 0.8)
 
+    def test_r2_score(self):
+        x = np.linspace(0, 1, 100)
+        y = np.random.normal(x, 1)
+        res = st.linregress(x, y)
+        assert_almost_equal(res.rvalue ** 2,
+                            r2_score(y, res.intercept +
+                                     res.slope * x).r2_median,
+                            2)
 
 class TestDfSummary(bf.ModelBackendSampledTestCase):
     backend = ndarray.NDArray
@@ -353,7 +331,7 @@ class TestDfSummary(bf.ModelBackendSampledTestCase):
                     pm.summary(trace, varnames=[varname])['n_eff']
                                  ).reshape(n_eff.shape)
             npt.assert_equal(n_eff, n_eff_df)
-            
+
             # test Rhat value
             rhat = pm.gelman_rubin(trace, varnames=[varname])[varname]
             rhat_df = np.asarray(
@@ -361,3 +339,7 @@ class TestDfSummary(bf.ModelBackendSampledTestCase):
                                  ).reshape(rhat.shape)
             npt.assert_equal(rhat, rhat_df)
 
+    def test_psis(self):
+        lw = np.random.randn(20000, 10)
+        _, ks = pm.stats._psislw(lw, 1.)
+        npt.assert_array_less(ks, .5)

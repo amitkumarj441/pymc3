@@ -22,7 +22,7 @@ def test_minibatch():
     y_obs = pm.data.Minibatch(y_train, batch_size=batch_size)
 
     with Model():
-        abc = Normal('abc', mu=mu0, sd=sd0, shape=(3,))
+        abc = Normal('abc', mu=mu0, sigma=sd0, shape=(3,))
         x = x_obs
         x2 = x**2
         o = tt.ones_like(x)
@@ -31,6 +31,6 @@ def test_minibatch():
         pm.Normal('y', mu=y, observed=y_obs)
 
         step_method = pm.SGFS(batch_size=batch_size, step_size=1., total_size=total_size)
-        trace = pm.sample(draws=draws, step=step_method, init=None)
+        trace = pm.sample(draws=draws, step=step_method, init=None, cores=2)
 
     np.testing.assert_allclose(np.mean(trace['abc'], axis=0), np.asarray([a, b, c]), rtol=0.1)

@@ -43,7 +43,7 @@ class Text(base.BaseTrace):
     def __init__(self, name, model=None, vars=None, test_point=None):
         if not os.path.exists(name):
             os.mkdir(name)
-        super(Text, self).__init__(name, model, vars, test_point)
+        super().__init__(name, model, vars, test_point)
 
         self.flat_names = {v: ttab.create_flat_names(v, shape)
                            for v, shape in self.var_shapes.items()}
@@ -99,8 +99,9 @@ class Text(base.BaseTrace):
         self._fh.write(','.join(columns) + '\n')
 
     def close(self):
-        self._fh.close()
-        self._fh = None  # Avoid serialization issue.
+        if self._fh is not None:
+            self._fh.close()
+            self._fh = None  # Avoid serialization issue.
 
     # Selection methods
 

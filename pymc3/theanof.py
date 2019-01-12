@@ -8,7 +8,6 @@ from theano.sandbox.rng_mrg import MRG_RandomStreams
 
 from .blocking import ArrayOrdering
 from .data import GeneratorAdapter
-from .memoize import memoize
 from .vartypes import typefilter, continuous_types
 
 __all__ = ['gradient',
@@ -17,6 +16,7 @@ __all__ = ['gradient',
            'inputvars',
            'cont_inputs',
            'floatX',
+           'intX',
            'smartfloatX',
            'jacobian',
            'CallableTensor',
@@ -68,9 +68,27 @@ def floatX(X):
         return np.asarray(X, dtype=theano.config.floatX)
 
 
+_conversion_map = {'float64': 'int32',
+                   'float32': 'int16',
+                   'float16': 'int8',
+                   'float8': 'int8'}
+
+
+def intX(X):
+    """
+    Convert a theano tensor or numpy array to theano.tensor.int32 type.
+    """
+    intX = _conversion_map[theano.config.floatX]
+    try:
+        return X.astype(intX)
+    except AttributeError:
+        # Scalar passed
+        return np.asarray(X, dtype=intX)
+
+
 def smartfloatX(x):
     """
-    Convert non int types to floatX 
+    Convert non int types to floatX
     """
     if str(x.dtype).startswith('float'):
         x = floatX(x)
@@ -85,10 +103,10 @@ def gradient1(f, v):
     """flat gradient of f wrt v"""
     return tt.flatten(tt.grad(f, v, disconnected_inputs='warn'))
 
+
 empty_gradient = tt.zeros(0, dtype='float32')
 
 
-@memoize
 def gradient(f, vars=None):
     if vars is None:
         vars = cont_inputs(f)
@@ -110,7 +128,6 @@ def jacobian1(f, v):
     return theano.map(grad_i, idx)[0]
 
 
-@memoize
 def jacobian(f, vars=None):
     if vars is None:
         vars = cont_inputs(f)
@@ -132,7 +149,6 @@ def jacobian_diag(f, x):
                        name='jacobian_diag')[0]
 
 
-@memoize
 @change_flags(compute_test_value='ignore')
 def hessian(f, vars=None):
     return -jacobian(gradient(f, vars), vars)
@@ -149,7 +165,6 @@ def hessian_diag1(f, v):
     return theano.map(hess_ii, idx)[0]
 
 
-@memoize
 @change_flags(compute_test_value='ignore')
 def hessian_diag(f, vars=None):
     if vars is None:
@@ -184,7 +199,7 @@ class IdentityOp(scalar.UnaryScalarOp):
         return "{z} = {x};".format(x=inp[0], z=out[0])
 
     def __eq__(self, other):
-        return type(self) == type(other)
+        return isinstance(self, type(other))
 
     def __hash__(self):
         return hash(type(self))
@@ -258,7 +273,7 @@ def reshape_t(x, shape):
         return x[0]
 
 
-class CallableTensor(object):
+class CallableTensor:
     """Turns a symbolic variable with one input into a function that returns symbolic arguments
     with the one variable replaced with the input.
     """
@@ -275,6 +290,7 @@ class CallableTensor(object):
         """
         oldinput, = inputvars(self.tensor)
         return theano.clone(self.tensor, {oldinput: input}, strict=False)
+
 
 scalar_identity = IdentityOp(scalar.upgrade_to_float, name='scalar_identity')
 identity = tt.Elemwise(scalar_identity, name='identity')
@@ -301,7 +317,7 @@ class GeneratorOp(Op):
     __props__ = ('generator',)
 
     def __init__(self, gen, default=None):
-        super(GeneratorOp, self).__init__()
+        super().__init__()
         if not isinstance(gen, GeneratorAdapter):
             gen = GeneratorAdapter(gen)
         self.generator = gen
@@ -463,5 +479,3 @@ def largest_common_dtype(tensors):
                  else smartfloatX(np.asarray(t)).dtype
                  for t in tensors)
     return np.stack([np.ones((), dtype=dtype) for dtype in dtypes]).dtype
-
-

@@ -3,15 +3,16 @@
     :alt: PyMC3 logo
     :align: center
 
-|Build Status| |Coverage| |NumFOCUS_badge|
+|Build Status| |Coverage| |NumFOCUS_badge| |Binder|
 
 PyMC3 is a Python package for Bayesian statistical modeling and Probabilistic Machine Learning
-which focuses on advanced Markov chain Monte Carlo and variational fitting
+focusing on advanced Markov chain Monte Carlo (MCMC) and variational inference (VI)
 algorithms. Its flexibility and extensibility make it applicable to a
 large suite of problems.
 
-Check out the `getting started guide <http://docs.pymc.io/notebooks/getting_started>`__!
-
+Check out the `getting started guide <http://docs.pymc.io/notebooks/getting_started>`__,  or
+`interact with live examples <https://mybinder.org/v2/gh/pymc-devs/pymc3/master?filepath=%2Fdocs%2Fsource%2Fnotebooks>`__
+using Binder!
 
 Features
 ========
@@ -50,9 +51,9 @@ Learn Bayesian statistics with a book together with PyMC3:
 
 -  `Probabilistic Programming and Bayesian Methods for Hackers <https://github.com/CamDavidsonPilon/Probabilistic-Programming-and-Bayesian-Methods-for-Hackers>`__: Fantastic book with many applied code examples.
 -  `PyMC3 port of the book "Doing Bayesian Data Analysis" by John Kruschke <https://github.com/aloctavodia/Doing_bayesian_data_analysis>`__ as well as the `second edition <https://github.com/JWarmenhoven/DBDA-python>`__: Principled introduction to Bayesian data analysis.
--  `PyMC3 port of the book "Statistical Rethinking A Bayesian Course with Examples in R and Stan" by Richard McElreath <https://github.com/aloctavodia/Statistical-Rethinking-with-Python-and-PyMC3>`__
--  `PyMC3 port of the book "Bayesian Cognitive Modeling" by Michael Lee and EJ Wagenmakers <https://github.com/junpenglao/Bayesian-Cognitive-Modeling-in-Pymc3>`__: Focused on using Bayesian statistics in cognitive modeling.
--  `Bayesian Analysis with Python by Osvaldo Martin <https://www.packtpub.com/big-data-and-business-intelligence/bayesian-analysis-python>`__ (and `errata <https://github.com/aloctavodia/BAP>`__): Great introductory book.
+-  `PyMC3 port of the book "Statistical Rethinking A Bayesian Course with Examples in R and Stan" by Richard McElreath <https://github.com/pymc-devs/resources/tree/master/Rethinking>`__
+-  `PyMC3 port of the book "Bayesian Cognitive Modeling" by Michael Lee and EJ Wagenmakers <https://github.com/pymc-devs/resources/tree/master/BCM>`__: Focused on using Bayesian statistics in cognitive modeling.
+-  `Bayesian Analysis with Python  <https://www.packtpub.com/big-data-and-business-intelligence/bayesian-analysis-python-second-edition>`__ (second edition) by Osvaldo Martin: Great introductory book. (`code <https://github.com/aloctavodia/BAP>`__ and errata).
 
 PyMC3 talks
 -----------
@@ -103,8 +104,8 @@ Another option is to clone the repository and install PyMC3 using
 Dependencies
 ============
 
-PyMC3 is tested on Python 2.7 and 3.6 and depends on Theano, NumPy,
-SciPy, Pandas, and Matplotlib (see ``requirements.txt`` for version
+PyMC3 is tested on Python 3.6 and depends on Theano, NumPy,
+SciPy, and Pandas (see ``requirements.txt`` for version
 information).
 
 Optional
@@ -113,8 +114,6 @@ Optional
 In addtion to the above dependencies, the GLM submodule relies on
 `Patsy <http://patsy.readthedocs.io/en/latest/>`__.
 
-`scikits.sparse <https://github.com/njsmith/scikits-sparse>`__
-enables sparse scaling matrices which are useful for large problems.
 
 Citing PyMC3
 ============
@@ -126,7 +125,7 @@ in Python using PyMC3. PeerJ Computer Science 2:e55
 Contact
 =======
 
-We are using `discourse.pymc.io <https://discourse.pymc.io/>`__ as our main communication channel. You can also follow us on `Twitter @pymc_devs <https://twitter.com/pymc_devs>`__ for updates and other announcements. 
+We are using `discourse.pymc.io <https://discourse.pymc.io/>`__ as our main communication channel. You can also follow us on `Twitter @pymc_devs <https://twitter.com/pymc_devs>`__ for updates and other announcements.
 
 To ask a question regarding modeling or usage of PyMC3 we encourage posting to our Discourse forum under the `“Questions” Category <https://discourse.pymc.io/c/questions>`__. You can also suggest feature in the `“Development” Category <https://discourse.pymc.io/c/development>`__.
 
@@ -144,12 +143,15 @@ License
 Software using PyMC3
 ====================
 
- - `sampled <https://github.com/ColCarroll/sampled>`__: Decorator for PyMC3.
- - `Bambi <https://github.com/bambinos/bambi>`__: BAyesian Model-Building Interface (BAMBI) in Python.
- - `gelato <https://github.com/ferrine/gelato>`__: Bayesian Neural Networks with PyMC3 and Lasagne.
- - `NiPyMC <https://github.com/PsychoinformaticsLab/nipymc>`__: Bayesian mixed-effects modeling of fMRI data in Python.
- - `beat <https://github.com/hvasbath/beat>`__: Bayesian Earthquake Analysis Tool.
-
+- `Exoplanet <https://github.com/dfm/exoplanet>`__: a toolkit for modeling of transit and/or radial velocity observations of exoplanets and other astronomical time series.
+- `Bambi <https://github.com/bambinos/bambi>`__: BAyesian Model-Building Interface (BAMBI) in Python.
+- `pymc3_models <https://github.com/parsing-science/pymc3_models>`__: Custom PyMC3 models built on top of the scikit-learn API.
+- `PMProphet <https://github.com/luke14free/pm-prophet>`__: PyMC3 port of Facebook's Prophet model for timeseries modeling
+- `webmc3 <https://github.com/AustinRochford/webmc3>`__: A web interface for exploring PyMC3 traces
+- `sampled <https://github.com/ColCarroll/sampled>`__: Decorator for PyMC3 models.
+- `NiPyMC <https://github.com/PsychoinformaticsLab/nipymc>`__: Bayesian mixed-effects modeling of fMRI data in Python.
+- `beat <https://github.com/hvasbath/beat>`__: Bayesian Earthquake Analysis Tool.
+- `BayesFit <https://github.com/Slugocm/BayesFit>`__: Bayesian Psychometric Curve Fitting Tool.
 
 Please contact us if your software is not listed here.
 
@@ -176,7 +178,11 @@ Sponsors
 
 |Quantopian|
 
-.. |Build Status| image:: https://travis-ci.org/pymc-devs/pymc3.png?branch=master
+|ODSC|
+
+.. |Binder| image:: https://mybinder.org/badge.svg
+   :target: https://mybinder.org/v2/gh/pymc-devs/pymc3/master?filepath=%2Fdocs%2Fsource%2Fnotebooks
+.. |Build Status| image:: https://travis-ci.org/pymc-devs/pymc3.svg?branch=master
    :target: https://travis-ci.org/pymc-devs/pymc3
 .. |Coverage| image:: https://coveralls.io/repos/github/pymc-devs/pymc3/badge.svg?branch=master
    :target: https://coveralls.io/github/pymc-devs/pymc3?branch=master
@@ -186,3 +192,5 @@ Sponsors
    :target: https://quantopian.com
 .. |NumFOCUS_badge| image:: https://img.shields.io/badge/powered%20by-NumFOCUS-orange.svg?style=flat&colorA=E1523D&colorB=007D8A
    :target: http://www.numfocus.org/
+.. |ODSC| image:: https://raw.githubusercontent.com/pymc-devs/pymc3/master/docs/odsc_logo.png
+   :target: https://odsc.com

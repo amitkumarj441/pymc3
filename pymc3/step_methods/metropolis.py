@@ -2,20 +2,21 @@ import numpy as np
 import numpy.random as nr
 import theano
 import scipy.linalg
+import warnings
 
 from ..distributions import draw_values
-from .arraystep import ArrayStepShared, ArrayStep, metrop_select, Competence
+from .arraystep import ArrayStepShared, PopulationArrayStepShared, ArrayStep, metrop_select, Competence
 import pymc3 as pm
 from pymc3.theanof import floatX
 
-__all__ = ['Metropolis', 'BinaryMetropolis', 'BinaryGibbsMetropolis',
+__all__ = ['Metropolis', 'DEMetropolis', 'BinaryMetropolis', 'BinaryGibbsMetropolis',
            'CategoricalGibbsMetropolis', 'NormalProposal', 'CauchyProposal',
            'LaplaceProposal', 'PoissonProposal', 'MultivariateNormalProposal']
 
 # Available proposal distributions for Metropolis
 
 
-class Proposal(object):
+class Proposal:
     def __init__(self, s):
         self.s = s
 
@@ -23,6 +24,11 @@ class Proposal(object):
 class NormalProposal(Proposal):
     def __call__(self):
         return nr.normal(scale=self.s)
+
+
+class UniformProposal(Proposal):
+    def __call__(self):
+        return nr.uniform(low=-self.s, high=self.s, size=len(self.s))
 
 
 class CauchyProposal(Proposal):
@@ -128,7 +134,7 @@ class Metropolis(ArrayStepShared):
 
         shared = pm.make_shared_replacements(vars, model)
         self.delta_logp = delta_logp(model.logpt, vars, shared)
-        super(Metropolis, self).__init__(vars, shared)
+        super().__init__(vars, shared)
 
     def astep(self, q0):
         if not self.steps_until_tune and self.tune:
@@ -148,8 +154,8 @@ class Metropolis(ArrayStepShared):
                 q = (q0 + delta).astype('int64')
             else:
                 delta[self.discrete] = np.round(
-                    delta[self.discrete], 0).astype('int64')
-                q = (q0 + delta).astype('int64')
+                    delta[self.discrete], 0)
+                q = (q0 + delta)
         else:
             q = floatX(q0 + delta)
 
@@ -168,9 +174,7 @@ class Metropolis(ArrayStepShared):
 
     @staticmethod
     def competence(var, has_grad):
-        if var.dtype in pm.discrete_types:
-            return Competence.COMPATIBLE
-        return Competence.INCOMPATIBLE
+        return Competence.COMPATIBLE
 
 
 def tune(scale, acc_rate):
@@ -252,7 +256,7 @@ class BinaryMetropolis(ArrayStep):
             raise ValueError(
                 'All variables must be Bernoulli for BinaryMetropolis')
 
-        super(BinaryMetropolis, self).__init__(vars, [model.fastlogp])
+        super().__init__(vars, [model.fastlogp])
 
     def astep(self, q0, logp):
 
@@ -293,12 +297,30 @@ class BinaryMetropolis(ArrayStep):
 
 
 class BinaryGibbsMetropolis(ArrayStep):
-    """A Metropolis-within-Gibbs step method optimized for binary variables"""
+    """A Metropolis-within-Gibbs step method optimized for binary variables
+
+    Parameters
+    ----------
+    vars : list
+        List of variables for sampler
+    order : list or 'random'
+        List of integers indicating the Gibbs update order
+        e.g., [0, 2, 1, ...]. Default is random
+    transit_p : float
+        The diagonal of the transition kernel. A value > .5 gives anticorrelated proposals,
+        which resulting in more efficient antithetical sampling.
+    model : PyMC Model
+        Optional model for sampling step. Defaults to None (taken from context).
+
+    """
     name = 'binary_gibbs_metropolis'
 
-    def __init__(self, vars, order='random', model=None):
+    def __init__(self, vars, order='random', transit_p=.8, model=None):
 
         model = pm.modelcontext(model)
+
+        # transition probabilities
+        self.transit_p = transit_p
 
         self.dim = sum(v.dsize for v in vars)
 
@@ -315,7 +337,7 @@ class BinaryGibbsMetropolis(ArrayStep):
             raise ValueError(
                 'All variables must be binary for BinaryGibbsMetropolis')
 
-        super(BinaryGibbsMetropolis, self).__init__(vars, [model.fastlogp])
+        super().__init__(vars, [model.fastlogp])
 
     def astep(self, q0, logp):
         order = self.order
@@ -326,11 +348,14 @@ class BinaryGibbsMetropolis(ArrayStep):
         logp_curr = logp(q)
 
         for idx in order:
-            curr_val, q[idx] = q[idx], True - q[idx]
-            logp_prop = logp(q)
-            q[idx], accepted = metrop_select(logp_prop - logp_curr, q[idx], curr_val)
-            if accepted:
-                logp_curr = logp_prop
+            # No need to do metropolis update if the same value is proposed,
+            # as you will get the same value regardless of accepted or reject
+            if nr.rand() < self.transit_p:
+                curr_val, q[idx] = q[idx], True - q[idx]
+                logp_prop = logp(q)
+                q[idx], accepted = metrop_select(logp_prop - logp_curr, q[idx], curr_val)
+                if accepted:
+                    logp_curr = logp_prop
 
         return q
 
@@ -348,6 +373,7 @@ class BinaryGibbsMetropolis(ArrayStep):
             return Competence.IDEAL
         return Competence.INCOMPATIBLE
 
+
 class CategoricalGibbsMetropolis(ArrayStep):
     """A Metropolis-within-Gibbs step method optimized for categorical variables.
        This step method works for Bernoulli variables as well, but it is not
@@ -356,7 +382,7 @@ class CategoricalGibbsMetropolis(ArrayStep):
        which was introduced by Liu in his 1996 technical report
        "Metropolized Gibbs Sampler: An Improvement".
     """
-    name = 'caregorical_gibbs_metropolis'
+    name = 'categorical_gibbs_metropolis'
 
     def __init__(self, vars, proposal='uniform', order='random', model=None):
 
@@ -398,7 +424,7 @@ class CategoricalGibbsMetropolis(ArrayStep):
             raise ValueError('Argument \'proposal\' should either be ' +
                     '\'uniform\' or \'proportional\'')
 
-        super(CategoricalGibbsMetropolis, self).__init__(vars, [model.fastlogp])
+        super().__init__(vars, [model.fastlogp])
 
     def astep_unif(self, q0, logp):
         dimcats = self.dimcats
@@ -465,15 +491,134 @@ class CategoricalGibbsMetropolis(ArrayStep):
             return Competence.COMPATIBLE
         return Competence.INCOMPATIBLE
 
+
+class DEMetropolis(PopulationArrayStepShared):
+    """
+    Differential Evolution Metropolis sampling step.
+
+    Parameters
+    ----------
+    lamb : float
+        Lambda parameter of the DE proposal mechanism. Defaults to 2.38 / sqrt(2 * ndim)
+    vars : list
+        List of variables for sampler
+    S : standard deviation or covariance matrix
+        Some measure of variance to parameterize proposal distribution
+    proposal_dist : function
+        Function that returns zero-mean deviates when parameterized with
+        S (and n). Defaults to Uniform(-S,+S).
+    scaling : scalar or array
+        Initial scale factor for epsilon. Defaults to 0.001
+    tune : bool
+        Flag for tuning the scaling. Defaults to True.
+    tune_interval : int
+        The frequency of tuning. Defaults to 100 iterations.
+    model : PyMC Model
+        Optional model for sampling step. Defaults to None (taken from context).
+    mode :  string or `Mode` instance.
+        compilation mode passed to Theano functions
+
+    References
+    ----------
+    .. [Braak2006] Cajo C.F. ter Braak (2006).
+        A Markov Chain Monte Carlo version of the genetic algorithm
+        Differential Evolution: easy Bayesian computing for real parameter spaces.
+        Statistics and Computing
+        `link <https://doi.org/10.1007/s11222-006-8769-1>`__
+    """
+    name = 'DEMetropolis'
+
+    default_blocked = True
+    generates_stats = True
+    stats_dtypes = [{
+        'accept': np.float64,
+        'tune': np.bool,
+    }]
+
+    def __init__(self, vars=None, S=None, proposal_dist=None, lamb=None, scaling=0.001,
+                 tune=True, tune_interval=100, model=None, mode=None, **kwargs):
+        warnings.warn('Population based sampling methods such as DEMetropolis are experimental.' \
+            ' Use carefully and be extra critical about their results!')
+
+        model = pm.modelcontext(model)
+
+        if vars is None:
+            vars = model.cont_vars
+        vars = pm.inputvars(vars)
+
+        if S is None:
+            S = np.ones(sum(v.dsize for v in vars))
+
+        if proposal_dist is not None:
+            self.proposal_dist = proposal_dist(S)
+        else:
+            self.proposal_dist = UniformProposal(S)
+
+        self.scaling = np.atleast_1d(scaling).astype('d')
+        if lamb is None:
+            lamb = 2.38 / np.sqrt(2 * S.size)
+        self.lamb = float(lamb)
+        self.tune = tune
+        self.tune_interval = tune_interval
+        self.steps_until_tune = tune_interval
+        self.accepted = 0
+
+        self.mode = mode
+
+        shared = pm.make_shared_replacements(vars, model)
+        self.delta_logp = delta_logp(model.logpt, vars, shared)
+        super().__init__(vars, shared)
+
+    def astep(self, q0):
+        if not self.steps_until_tune and self.tune:
+            # Tune scaling parameter
+            self.scaling = tune(
+                self.scaling, self.accepted / float(self.tune_interval))
+            # Reset counter
+            self.steps_until_tune = self.tune_interval
+            self.accepted = 0
+
+        epsilon = self.proposal_dist() * self.scaling
+
+        # differential evolution proposal
+        # select two other chains
+        ir1, ir2 = np.random.choice(self.other_chains, 2, replace=False)
+        r1 = self.bij.map(self.population[ir1])
+        r2 = self.bij.map(self.population[ir2])
+        # propose a jump
+        q = floatX(q0 + self.lamb * (r1 - r2) + epsilon)
+
+        accept = self.delta_logp(q, q0)
+        q_new, accepted = metrop_select(accept, q, q0)
+        self.accepted += accepted
+
+        self.steps_until_tune -= 1
+
+        stats = {
+            'tune': self.tune,
+            'accept': np.exp(accept),
+        }
+
+        return q_new, [stats]
+
+    @staticmethod
+    def competence(var, has_grad):
+        if var.dtype in pm.discrete_types:
+            return Competence.INCOMPATIBLE
+        return Competence.COMPATIBLE
+
+
 def sample_except(limit, excluded):
     candidate = nr.choice(limit - 1)
     if candidate >= excluded:
         candidate += 1
     return candidate
 
+
 def softmax(x):
     e_x = np.exp(x - np.max(x))
     return e_x / np.sum(e_x, axis = 0)
+
 
 def delta_logp(logp, vars, shared):
     [logp0], inarray0 = pm.join_nonshared_inputs([logp], vars, shared)

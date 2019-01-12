@@ -9,29 +9,32 @@ import theano.tensor as tt
 
 from scipy import stats, linalg
 
-from theano.tensor.nlinalg import det, matrix_inverse, trace
-import theano.tensor.slinalg
+from theano.tensor.nlinalg import det, matrix_inverse, trace, eigh
+from theano.tensor.slinalg import Cholesky
 import pymc3 as pm
 
 from pymc3.theanof import floatX
 from . import transforms
 from pymc3.util import get_variable_name
-from .distribution import Continuous, Discrete, draw_values, generate_samples
+from .distribution import (Continuous, Discrete, draw_values, generate_samples,
+                           _DrawValuesContext)
 from ..model import Deterministic
 from .continuous import ChiSquared, Normal
 from .special import gammaln, multigammaln
-from .dist_math import bound, logpow, factln, Cholesky
+from .dist_math import bound, logpow, factln
+from ..math import kron_dot, kron_diag, kron_solve_lower, kronecker
 
 
 __all__ = ['MvNormal', 'MvStudentT', 'Dirichlet',
            'Multinomial', 'Wishart', 'WishartBartlett',
-           'LKJCorr', 'LKJCholeskyCov']
+           'LKJCorr', 'LKJCholeskyCov', 'MatrixNormal',
+           'KroneckerNormal']
 
 
 class _QuadFormBase(Continuous):
     def __init__(self, mu=None, cov=None, chol=None, tau=None, lower=True,
                  *args, **kwargs):
-        super(_QuadFormBase, self).__init__(*args, **kwargs)
+        super().__init__(*args, **kwargs)
         if len(self.shape) > 2:
             raise ValueError("Only 1 or 2 dimensions are allowed.")
 
@@ -47,7 +50,7 @@ class _QuadFormBase(Continuous):
         # moment. We work around that by using a cholesky op
         # that returns a nan as first entry instead of raising
         # an error.
-        cholesky = Cholesky(nofail=True, lower=True)
+        cholesky = Cholesky(lower=True, on_error='nan')
 
         if cov is not None:
             self.k = cov.shape[0]
@@ -156,7 +159,7 @@ class MvNormal(_QuadFormBase):
     .. math::
 
        f(x \mid \pi, T) =
-           \frac{|T|^{1/2}}{(2\pi)^{1/2}}
+           \frac{|T|^{1/2}}{(2\pi)^{k/2}}
            \exp\left\{ -\frac{1}{2} (x-\mu)^{\prime} T (x-\mu) \right\}
 
     ========  ==========================
@@ -212,27 +215,27 @@ class MvNormal(_QuadFormBase):
         chol_packed = pm.LKJCholeskyCov('chol_packed',
             n=3, eta=2, sd_dist=sd_dist)
         chol = pm.expand_packed_triangular(3, chol_packed)
-        vals_raw = pm.Normal('vals_raw', mu=0, sd=1, shape=(5, 3))
+        vals_raw = pm.Normal('vals_raw', mu=0, sigma=1, shape=(5, 3))
         vals = pm.Deterministic('vals', tt.dot(chol, vals_raw.T).T)
     """
 
     def __init__(self, mu, cov=None, tau=None, chol=None, lower=True,
                  *args, **kwargs):
-        super(MvNormal, self).__init__(mu=mu, cov=cov, tau=tau, chol=chol,
-                                       lower=lower, *args, **kwargs)
+        super().__init__(mu=mu, cov=cov, tau=tau, chol=chol, lower=lower, *args, **kwargs)
         self.mean = self.median = self.mode = self.mu = self.mu
 
     def random(self, point=None, size=None):
         if size is None:
-            size = []
+            size = tuple()
         else:
-            try:
-                size = list(size)
-            except TypeError:
-                size = [size]
+            if not isinstance(size, tuple):
+                try:
+                    size = tuple(size)
+                except TypeError:
+                    size = (size,)
 
         if self._cov_type == 'cov':
-            mu, cov = draw_values([self.mu, self.cov], point=point)
+            mu, cov = draw_values([self.mu, self.cov], point=point, size=size)
             if mu.shape[-1] != cov.shape[-1]:
                 raise ValueError("Shapes for mu and cov don't match")
 
@@ -240,28 +243,43 @@ class MvNormal(_QuadFormBase):
                 dist = stats.multivariate_normal(
                     mean=mu, cov=cov, allow_singular=True)
             except ValueError:
-                size.append(mu.shape[-1])
+                size += (mu.shape[-1],)
                 return np.nan * np.zeros(size)
             return dist.rvs(size)
         elif self._cov_type == 'chol':
-            mu, chol = draw_values([self.mu, self.chol_cov], point=point)
-            if mu.shape[-1] != chol[0].shape[-1]:
+            mu, chol = draw_values([self.mu, self.chol_cov],
+                                   point=point, size=size)
+            if size and mu.ndim == len(size) and mu.shape == size:
+                mu = mu[..., np.newaxis]
+            if mu.shape[-1] != chol.shape[-1] and mu.shape[-1] != 1:
                 raise ValueError("Shapes for mu and chol don't match")
+            broadcast_shape = (
+                np.broadcast(np.empty(mu.shape[:-1]),
+                             np.empty(chol.shape[:-2])).shape
+            )
 
-            size.append(mu.shape[-1])
-            standard_normal = np.random.standard_normal(size)
-            return mu + np.dot(standard_normal, chol.T)
+            mu = np.broadcast_to(mu, broadcast_shape + (chol.shape[-1],))
+            chol = np.broadcast_to(chol, broadcast_shape + chol.shape[-2:])
+            # If mu and chol were fixed by the point, only the standard normal
+            # should change
+            if mu.shape[:len(size)] != size:
+                std_norm_shape = size + mu.shape
+            else:
+                std_norm_shape = mu.shape
+            standard_normal = np.random.standard_normal(std_norm_shape)
+            return mu + np.tensordot(standard_normal, chol, axes=[[-1], [-1]])
         else:
-            mu, tau = draw_values([self.mu, self.tau], point=point)
+            mu, tau = draw_values([self.mu, self.tau], point=point, size=size)
             if mu.shape[-1] != tau[0].shape[-1]:
                 raise ValueError("Shapes for mu and tau don't match")
 
-            size.append(mu.shape[-1])
-            standard_normal = np.random.standard_normal(size)
+            size += (mu.shape[-1],)
             try:
                 chol = linalg.cholesky(tau, lower=True)
             except linalg.LinAlgError:
                 return np.nan * np.zeros(size)
+
+            standard_normal = np.random.standard_normal(size)
             transformed = linalg.solve_triangular(
                 chol, standard_normal.T, lower=True)
             return mu + transformed.T
@@ -324,29 +342,29 @@ class MvStudentT(_QuadFormBase):
     """
 
     def __init__(self, nu, Sigma=None, mu=None, cov=None, tau=None, chol=None,
-                 lower=None, *args, **kwargs):
+                 lower=True, *args, **kwargs):
         if Sigma is not None:
             if cov is not None:
                 raise ValueError('Specify only one of cov and Sigma')
             cov = Sigma
-        super(MvStudentT, self).__init__(mu=mu, cov=cov, tau=tau, chol=chol,
-                                         lower=lower, *args, **kwargs)
+        super().__init__(mu=mu, cov=cov, tau=tau, chol=chol, lower=lower, *args, **kwargs)
         self.nu = nu = tt.as_tensor_variable(nu)
         self.mean = self.median = self.mode = self.mu = self.mu
 
     def random(self, point=None, size=None):
-        nu, mu = draw_values([self.nu, self.mu], point=point)
-        if self._cov_type == 'cov':
-            cov, = draw_values([self.cov], point=point)
-            dist = MvNormal.dist(mu=np.zeros_like(mu), cov=cov)
-        elif self._cov_type == 'tau':
-            tau, = draw_values([self.tau], point=point)
-            dist = MvNormal.dist(mu=np.zeros_like(mu), tau=tau)
-        else:
-            chol, = draw_values([self.chol_cov], point=point)
-            dist = MvNormal.dist(mu=np.zeros_like(mu), chol=chol)
+        with _DrawValuesContext():
+            nu, mu = draw_values([self.nu, self.mu], point=point, size=size)
+            if self._cov_type == 'cov':
+                cov, = draw_values([self.cov], point=point, size=size)
+                dist = MvNormal.dist(mu=np.zeros_like(mu), cov=cov)
+            elif self._cov_type == 'tau':
+                tau, = draw_values([self.tau], point=point, size=size)
+                dist = MvNormal.dist(mu=np.zeros_like(mu), tau=tau)
+            else:
+                chol, = draw_values([self.chol_cov], point=point, size=size)
+                dist = MvNormal.dist(mu=np.zeros_like(mu), chol=chol)
 
-        samples = dist.random(point, size)
+            samples = dist.random(point, size)
 
         chi2 = np.random.chisquare
         return (np.sqrt(nu) * samples.T / chi2(nu, size)).T + mu
@@ -380,10 +398,9 @@ class Dirichlet(Continuous):
 
     .. math::
 
-       f(\mathbf{x}) =
-           \frac{\Gamma(\sum_{i=1}^k \theta_i)}{\prod \Gamma(\theta_i)}
-           \prod_{i=1}^{k-1} x_i^{\theta_i - 1}
-           \left(1-\sum_{i=1}^{k-1}x_i\right)^\theta_k
+       f(\mathbf{x}|\mathbf{a}) =
+           \frac{\Gamma(\sum_{i=1}^k a_i)}{\prod_{i=1}^k \Gamma(a_i)}
+           \prod_{i=1}^k x_i^{a_i - 1}
 
     ========  ===============================================
     Support   :math:`x_i \in (0, 1)` for :math:`i \in \{1, \ldots, K\}`
@@ -397,19 +414,16 @@ class Dirichlet(Continuous):
     ----------
     a : array
         Concentration parameters (a > 0).
-
-    Notes
-    -----
-    Only the first `k-1` elements of `x` are expected. Can be used
-    as a parent of Multinomial and Categorical nevertheless.
     """
 
     def __init__(self, a, transform=transforms.stick_breaking,
                  *args, **kwargs):
-        shape = a.shape[-1]
-        kwargs.setdefault("shape", shape)
-        super(Dirichlet, self).__init__(transform=transform, *args, **kwargs)
+        shape = np.atleast_1d(a.shape)[-1]
 
+        kwargs.setdefault("shape", shape)
+        super().__init__(transform=transform, *args, **kwargs)
+
+        self.size_prefix = tuple(self.shape[:-1])
         self.k = tt.as_tensor_variable(shape)
         self.a = a = tt.as_tensor_variable(a)
         self.mean = a / tt.sum(a)
@@ -418,13 +432,31 @@ class Dirichlet(Continuous):
                               (a - 1) / tt.sum(a - 1),
                               np.nan)
 
+    def _random(self, a, size=None):
+        gen = stats.dirichlet.rvs
+        shape = tuple(np.atleast_1d(self.shape))
+        if size[-len(shape):] == shape:
+            real_size = size[:-len(shape)]
+        else:
+            real_size = size
+        if self.size_prefix:
+            if real_size and real_size[0] == 1:
+                real_size = real_size[1:] + self.size_prefix
+            else:
+                real_size = real_size + self.size_prefix
+
+        if a.ndim == 1:
+            samples = gen(alpha=a, size=real_size)
+        else:
+            unrolled = a.reshape((np.prod(a.shape[:-1]), a.shape[-1]))
+            samples = np.array([gen(alpha=aa, size=1) for aa in unrolled])
+            samples = samples.reshape(a.shape)
+        return samples
+
     def random(self, point=None, size=None):
-        a = draw_values([self.a], point=point)[0]
-
-        def _random(a, size=None):
-            return stats.dirichlet.rvs(a, None if size == a.shape else size)
-
-        samples = generate_samples(_random, a,
+        a = draw_values([self.a], point=point, size=size)[0]
+        samples = generate_samples(self._random,
+                                   a=a,
                                    dist_shape=self.shape,
                                    size=size)
         return samples
@@ -482,17 +514,17 @@ class Multinomial(Discrete):
     """
 
     def __init__(self, n, p, *args, **kwargs):
-        super(Multinomial, self).__init__(*args, **kwargs)
+        super().__init__(*args, **kwargs)
 
         p = p / tt.sum(p, axis=-1, keepdims=True)
         n = np.squeeze(n) # works also if n is a tensor
 
         if len(self.shape) > 1:
             m = self.shape[-2]
-            try:
-                assert n.shape == (m,)
-            except (AttributeError, AssertionError):
-                n = n * tt.ones(m)
+            # try:
+            #     assert n.shape == (m,)
+            # except (AttributeError, AssertionError):
+            #     n = n * tt.ones(m)
             self.n = tt.shape_padright(n)
             self.p = p if p.ndim > 1 else tt.shape_padleft(p)
         elif n.ndim == 1:
@@ -516,33 +548,97 @@ class Multinomial(Discrete):
         # Set float type to float64 for numpy. This change is related to numpy issue #8317 (https://github.com/numpy/numpy/issues/8317)
         p = p.astype('float64')
         # Now, re-normalize all of the values in float64 precision. This is done inside the conditionals
-        if size == p.shape:
-            size = None
-        if (n.ndim == 0) and (p.ndim == 1):
+
+        # np.random.multinomial needs `n` to be a scalar int and `p` a
+        # sequence
+        if p.ndim == 1 and (n.ndim == 0 or (n.ndim == 1 and n.shape[0] == 1)):
+            # If `n` is already a scalar and `p` is a sequence, then just
+            # return np.multinomial with some size handling
             p = p / p.sum()
-            randnum = np.random.multinomial(n, p.squeeze(), size=size)
-        elif (n.ndim == 0) and (p.ndim > 1):
-            p = p / p.sum(axis=1, keepdims=True)
-            randnum = np.asarray([
-                np.random.multinomial(n.squeeze(), pp, size=size)
-                for pp in p
-            ])
-        elif (n.ndim > 0) and (p.ndim == 1):
-            p = p / p.sum()
-            randnum = np.asarray([
-                np.random.multinomial(nn, p.squeeze(), size=size)
-                for nn in n
-            ])
+            if size is not None:
+                if size == p.shape:
+                    size = None
+                elif size[-len(p.shape):] == p.shape:
+                    size = size[:len(size) - len(p.shape)]
+            randnum = np.random.multinomial(n, p, size=size)
+            return randnum.astype(original_dtype)
+        # The shapes of `p` and `n` must be broadcasted by hand depending on
+        # their ndim. We will assume that the last axis of the `p` array will
+        # be the sequence to feed into np.random.multinomial. The other axis
+        # will only have to be iterated over.
+        if n.ndim == p.ndim:
+            # p and n have the same ndim, so n.shape[-1] must be 1
+            if n.shape[-1] != 1:
+                raise ValueError('If n and p have the same number of '
+                                 'dimensions, the last axis of n must be '
+                                 'have len 1. Got {} instead.\n'
+                                 'n.shape = {}\n'
+                                 'p.shape = {}.'.format(n.shape[-1],
+                                                        n.shape,
+                                                        p.shape))
+            n_p_shape = np.broadcast(np.empty(p.shape[:-1]),
+                                     np.empty(n.shape[:-1])).shape
+            p = np.broadcast_to(p, n_p_shape + (p.shape[-1],))
+            n = np.broadcast_to(n, n_p_shape + (1,))
+        elif n.ndim == p.ndim - 1:
+            # n has the number of dimensions of p for the iteration, these must
+            # broadcast together
+            n_p_shape = np.broadcast(np.empty(p.shape[:-1]),
+                                     n).shape
+            p = np.broadcast_to(p, n_p_shape + (p.shape[-1],))
+            n = np.broadcast_to(n, n_p_shape + (1,))
+        elif p.ndim == 1:
+            # p only has the sequence array. We extend it with the dimensions
+            # of n
+            n_p_shape = n.shape
+            p = np.broadcast_to(p, n_p_shape + (p.shape[-1],))
+            n = np.broadcast_to(n, n_p_shape + (1,))
+        elif n.ndim == 0 or (n.dim == 1 and n.shape[0] == 1):
+            # n is a scalar. We extend it with the dimensions of p
+            n_p_shape = p.shape[:-1]
+            n = np.broadcast_to(n, n_p_shape + (1,))
         else:
-            p = p / p.sum(axis=1, keepdims=True)
-            randnum = np.asarray([
-                np.random.multinomial(nn, pp, size=size)
-                for (nn, pp) in zip(n, p)
-            ])
+            # There is no clear rule to broadcast p and n so we raise an error
+            raise ValueError('Incompatible shapes of n and p.\n'
+                             'n.shape = {}\n'
+                             'p.shape = {}'.format(n.shape, p.shape))
+
+        # Check what happens with size
+        if size is not None:
+            if size == p.shape:
+                size = None
+                _size = 1
+            elif size[-len(p.shape):] == p.shape:
+                size = size[:len(size) - len(p.shape)]
+                _size = np.prod(size)
+            else:
+                _size = np.prod(size)
+        else:
+            _size = 1
+
+        # We now flatten p and n up to the last dimension
+        p_shape = p.shape
+        p = np.reshape(p, (np.prod(n_p_shape), -1))
+        n = np.reshape(n, (np.prod(n_p_shape), -1))
+        # We renormalize p
+        p = p / p.sum(axis=1, keepdims=True)
+        # We iterate calls to np.random.multinomial
+        randnum = np.asarray([
+            np.random.multinomial(nn, pp, size=_size)
+            for (nn, pp) in zip(n, p)
+        ])
+        # We swap the iteration axis with the _size axis
+        randnum = np.moveaxis(randnum, 1, 0)
+        # We reshape the random numbers to the corresponding size + p_shape
+        if size is None:
+            randnum = np.reshape(randnum, p_shape)
+        else:
+            randnum = np.reshape(randnum, size + p_shape)
+        # We cast back to the original dtype
         return randnum.astype(original_dtype)
 
     def random(self, point=None, size=None):
-        n, p = draw_values([self.n, self.p], point=point)
+        n, p = draw_values([self.n, self.p], point=point, size=size)
         samples = generate_samples(self._random, n, p,
                                    dist_shape=self.shape,
                                    size=size)
@@ -553,7 +649,7 @@ class Multinomial(Discrete):
         p = self.p
 
         return bound(
-            tt.sum(factln(n)) - tt.sum(factln(x)) + tt.sum(x * tt.log(p)),
+            factln(n) + tt.sum(-factln(x) + logpow(p, x), axis=-1, keepdims=True),
             tt.all(x >= 0),
             tt.all(tt.eq(tt.sum(x, axis=-1, keepdims=True), n)),
             tt.all(p <= 1),
@@ -574,9 +670,9 @@ class Multinomial(Discrete):
 
 def posdef(AA):
     try:
-        np.linalg.cholesky(AA)
+        linalg.cholesky(AA)
         return 1
-    except np.linalg.LinAlgError:
+    except linalg.LinAlgError:
         return 0
 
 
@@ -652,14 +748,14 @@ class Wishart(Continuous):
     V : array
         p x p positive definite matrix.
 
-    Note
-    ----
+    Notes
+    -----
     This distribution is unusable in a PyMC3 model. You should instead
     use LKJCholeskyCov or LKJCorr.
     """
 
     def __init__(self, nu, V, *args, **kwargs):
-        super(Wishart, self).__init__(*args, **kwargs)
+        super().__init__(*args, **kwargs)
         warnings.warn('The Wishart distribution can currently not be used '
                       'for MCMC sampling. The probability of sampling a '
                       'symmetric matrix is basically zero. Instead, please '
@@ -676,7 +772,7 @@ class Wishart(Continuous):
                               np.nan)
 
     def random(self, point=None, size=None):
-        nu, V = draw_values([self.nu, self.V], point=point)
+        nu, V = draw_values([self.nu, self.V], point=point, size=size)
         size= 1 if size is None else size
         return generate_samples(stats.wishart.rvs, np.asscalar(nu), V,
                                     broadcast_shape=(size,))
@@ -746,11 +842,11 @@ def WishartBartlett(name, S, nu, is_cholesky=False, return_cholesky=False, testv
     testval : ndarray
         p x p positive definite matrix used to initialize
 
-    Note
-    ----
+    Notes
+    -----
     This is not a standard Distribution class but follows a similar
     interface. Besides the Wishart distribution, it will add RVs
-    c and z to your model which make up the matrix.
+    name_c and name_z to your model which make up the matrix.
 
     This distribution is usually a bad idea to use as a prior for multivariate
     normal. You should instead use LKJCholeskyCov or LKJCorr.
@@ -765,18 +861,18 @@ def WishartBartlett(name, S, nu, is_cholesky=False, return_cholesky=False, testv
     if testval is not None:
         # Inverse transform
         testval = np.dot(np.dot(np.linalg.inv(L), testval), np.linalg.inv(L.T))
-        testval = scipy.linalg.cholesky(testval, lower=True)
+        testval = linalg.cholesky(testval, lower=True)
         diag_testval = testval[diag_idx]**2
         tril_testval = testval[tril_idx]
     else:
         diag_testval = None
         tril_testval = None
 
-    c = tt.sqrt(ChiSquared('c', nu - np.arange(2, 2 + n_diag), shape=n_diag,
+    c = tt.sqrt(ChiSquared('%s_c' % name, nu - np.arange(2, 2 + n_diag), shape=n_diag,
                            testval=diag_testval))
-    pm._log.info('Added new variable c to model diagonal of Wishart.')
-    z = Normal('z', 0., 1., shape=n_tril, testval=tril_testval)
-    pm._log.info('Added new variable z to model off-diagonals of Wishart.')
+    pm._log.info('Added new variable %s_c to model diagonal of Wishart.' % name)
+    z = Normal('%s_z' % name, 0., 1., shape=n_tril, testval=tril_testval)
+    pm._log.info('Added new variable %s_z to model off-diagonals of Wishart.' % name)
     # Construct A matrix
     A = tt.zeros(S.shape, dtype=np.float32)
     A = tt.set_subtensor(A[diag_idx], c)
@@ -857,7 +953,7 @@ class LKJCholeskyCov(Continuous):
             vals = pm.MvNormal('vals', mu=np.zeros(10), chol=chol, shape=10)
 
             # Or transform an uncorrelated normal:
-            vals_raw = pm.Normal('vals_raw', mu=np.zeros(10), sd=1)
+            vals_raw = pm.Normal('vals_raw', mu=0, sigma=1, shape=10)
             vals = tt.dot(chol, vals_raw)
 
             # Or compute the covariance matrix
@@ -866,9 +962,7 @@ class LKJCholeskyCov(Continuous):
             # Extract the standard deviations
             stds = tt.sqrt(tt.diag(cov))
 
-    Implementation
-    --------------
-    In the unconstrained space all values of the cholesky factor
+    **Implementation** In the unconstrained space all values of the cholesky factor
     are stored untransformed, except for the diagonal entries, where
     we use a log-transform to restrict them to positive values.
 
@@ -922,7 +1016,7 @@ class LKJCholeskyCov(Continuous):
         self.n = n
         self.eta = eta
 
-        if 'transform' in kwargs:
+        if 'transform' in kwargs and kwargs['transform'] is not None:
             raise ValueError('Invalid parameter: transform.')
         if 'shape' in kwargs:
             raise ValueError('Invalid parameter: shape.')
@@ -936,7 +1030,7 @@ class LKJCholeskyCov(Continuous):
 
         kwargs['shape'] = shape
         kwargs['transform'] = transform
-        super(LKJCholeskyCov, self).__init__(*args, **kwargs)
+        super().__init__(*args, **kwargs)
 
         self.sd_dist = sd_dist
         self.diag_idxs = transform.diag_idxs
@@ -972,6 +1066,90 @@ class LKJCholeskyCov(Continuous):
         norm = _lkj_normalizing_constant(eta, n)
 
         return norm + logp_lkj + logp_sd + det_invjac
+
+    def _random(self, n, eta, size=1):
+        eta_sample_shape = (size,) + eta.shape
+        P = np.eye(n) * np.ones(eta_sample_shape + (n, n))
+        # original implementation in R see:
+        # https://github.com/rmcelreath/rethinking/blob/master/R/distributions.r
+        beta = eta - 1. + n/2.
+        r12 = 2. * stats.beta.rvs(a=beta, b=beta, size=eta_sample_shape) - 1.
+        P[..., 0, 1] = r12
+        P[..., 1, 1] = np.sqrt(1. - r12**2)
+        for mp1 in range(2, n):
+            beta -= 0.5
+            y = stats.beta.rvs(a=mp1 / 2., b=beta, size=eta_sample_shape)
+            z = stats.norm.rvs(loc=0, scale=1, size=eta_sample_shape + (mp1,))
+            z = z / np.sqrt(np.einsum('ij,ij->j', z, z))
+            P[..., 0:mp1, mp1] = np.sqrt(y[..., np.newaxis]) * z
+            P[..., mp1, mp1] = np.sqrt(1. - y)
+        C = np.einsum('...ji,...jk->...ik', P, P)
+        D = np.atleast_1d(self.sd_dist.random(size=P.shape[:-2]))
+        if D.shape in [tuple(), (1,)]:
+            D = self.sd_dist.random(size=P.shape[:-1])
+        elif D.ndim < C.ndim - 1:
+            D = [D] + [self.sd_dist.random(size=P.shape[:-2])
+                       for _ in range(n - 1)]
+            D = np.moveaxis(np.array(D), 0, C.ndim - 2)
+        elif D.ndim == C.ndim - 1:
+            if D.shape[-1] == 1:
+                D = [D] + [self.sd_dist.random(size=P.shape[:-2])
+                           for _ in range(n - 1)]
+                D = np.concatenate(D, axis=-1)
+            elif D.shape[-1] != n:
+                raise ValueError('The size of the samples drawn from the '
+                                 'supplied sd_dist.random have the wrong '
+                                 'size. Expected {} but got {} instead.'.
+                                 format(n, D.shape[-1]))
+        else:
+            raise ValueError('Supplied sd_dist.random generates samples with '
+                             'too many dimensions. It must yield samples '
+                             'with 0 or 1 dimensions. Got {} instead'.
+                             format(D.ndim - C.ndim - 2))
+        C *= D[..., :, np.newaxis] * D[..., np.newaxis, :]
+        tril_idx = np.tril_indices(n, k=0)
+        return np.linalg.cholesky(C)[..., tril_idx[0], tril_idx[1]]
+
+    def random(self, point=None, size=None):
+        # Get parameters and broadcast them
+        n, eta = draw_values([self.n, self.eta], point=point, size=size)
+        broadcast_shape = np.broadcast(n, eta).shape
+        # We can only handle cov matrices with a constant n per random call
+        n = np.unique(n)
+        if len(n) > 1:
+            raise RuntimeError('Varying n is not supported for LKJCholeskyCov')
+        n = int(n[0])
+        dist_shape = ((n * (n + 1)) // 2,)
+        # We make sure that eta and the drawn n get their shapes broadcasted
+        eta = np.broadcast_to(eta, broadcast_shape)
+        # We change the size of the draw depending on the broadcast shape
+        sample_shape = broadcast_shape + dist_shape
+        if size is not None:
+            if not isinstance(size, tuple):
+                try:
+                    size = tuple(size)
+                except TypeError:
+                    size = (size,)
+            if size == sample_shape:
+                size = None
+            elif size == broadcast_shape:
+                size = None
+            elif size[-len(sample_shape):] == sample_shape:
+                size = size[:len(size) - len(sample_shape)]
+            elif size[-len(broadcast_shape):] == broadcast_shape:
+                size = size[:len(size) - len(broadcast_shape)]
+        # We will always provide _random with an integer size and then reshape
+        # the output to get the correct size
+        if size is not None:
+            _size = np.prod(size)
+        else:
+            _size = 1
+        samples = self._random(n, eta, size=_size)
+        if size is None:
+            samples = samples[0]
+        else:
+            samples = np.reshape(samples, size + sample_shape)
+        return samples
 
 
 class LKJCorr(Continuous):
@@ -1039,8 +1217,7 @@ class LKJCorr(Continuous):
         if transform == 'interval':
             transform = transforms.interval(-1, 1)
 
-        super(LKJCorr, self).__init__(shape=shape, transform=transform,
-                                      *args, **kwargs)
+        super().__init__(shape=shape, transform=transform, *args, **kwargs)
         warnings.warn('Parameters in LKJCorr have been rename: shape parameter n -> eta '
                       'dimension parameter p -> n. Please double check your initialization.',
                       DeprecationWarning)
@@ -1052,25 +1229,24 @@ class LKJCorr(Continuous):
         size = size if isinstance(size, tuple) else (size,)
         # original implementation in R see:
         # https://github.com/rmcelreath/rethinking/blob/master/R/distributions.r
-        beta = eta - 1 + n/2
-        r12 = 2 * stats.beta.rvs(a=beta, b=beta, size=size) - 1
+        beta = eta - 1. + n/2.
+        r12 = 2. * stats.beta.rvs(a=beta, b=beta, size=size) - 1.
         P = np.eye(n)[:, :, np.newaxis] * np.ones(size)
         P[0, 1] = r12
-        P[1, 1] = np.sqrt(1 - r12**2)
-        if n > 2:
-            for m in range(1, n-1):
-                beta -= 0.5
-                y = stats.beta.rvs(a=(m+1) / 2., b=beta, size=size)
-                z = stats.norm.rvs(loc=0, scale=1, size=(m+1, ) + size)
-                z = z / np.sqrt(np.einsum('ij,ij->j', z, z))
-                P[0:m+1, m+1] = np.sqrt(y) * z
-                P[m+1, m+1] = np.sqrt(1 - y)
-        Pt = np.transpose(P, (2, 0 ,1))
-        C = np.einsum('...ji,...jk->...ik', Pt, Pt)
-        return C.transpose((1, 2, 0))[np.triu_indices(n, k=1)].T
+        P[1, 1] = np.sqrt(1. - r12**2)
+        for mp1 in range(2, n):
+            beta -= 0.5
+            y = stats.beta.rvs(a=mp1 / 2., b=beta, size=size)
+            z = stats.norm.rvs(loc=0, scale=1, size=(mp1, ) + size)
+            z = z / np.sqrt(np.einsum('ij,ij->j', z, z))
+            P[0:mp1, mp1] = np.sqrt(y) * z
+            P[mp1, mp1] = np.sqrt(1. - y)
+        C = np.einsum('ji...,jk...->...ik', P, P)
+        triu_idx = np.triu_indices(n, k=1)
+        return C[..., triu_idx[0], triu_idx[1]]
 
     def random(self, point=None, size=None):
-        n, eta = draw_values([self.n, self.eta], point=point)
+        n, eta = draw_values([self.n, self.eta], point=point, size=size)
         size= 1 if size is None else size
         samples = generate_samples(self._random, n, eta,
                                    broadcast_shape=(size,))
@@ -1091,3 +1267,439 @@ class LKJCorr(Continuous):
                      eta > 0,
                      broadcast_conditions=False
         )
+
+
+class MatrixNormal(Continuous):
+    R"""
+    Matrix-valued normal log-likelihood.
+
+    .. math::
+       f(x \mid \mu, U, V) =
+           \frac{1}{(2\pi |U|^n |V|^m)^{1/2}}
+           \exp\left\{
+                -\frac{1}{2} \mathrm{Tr}[ V^{-1} (x-\mu)^{\prime} U^{-1} (x-\mu)]
+            \right\}
+
+    ===============  =====================================
+    Support          :math:`x \in \mathbb{R}^{m \times n}`
+    Mean             :math:`\mu`
+    Row Variance     :math:`U`
+    Column Variance  :math:`V`
+    ===============  =====================================
+
+    Parameters
+    ----------
+    mu : array
+        Array of means. Must be broadcastable with the random variable X such
+        that the shape of mu + X is (m,n).
+    rowcov : mxm array
+        Among-row covariance matrix. Defines variance within
+        columns. Exactly one of rowcov or rowchol is needed.
+    rowchol : mxm array
+        Cholesky decomposition of among-row covariance matrix. Exactly one of
+        rowcov or rowchol is needed.
+    colcov : nxn array
+        Among-column covariance matrix. If rowcov is the identity matrix,
+        this functions as `cov` in MvNormal.
+        Exactly one of colcov or colchol is needed.
+    colchol : nxn array
+        Cholesky decomposition of among-column covariance matrix. Exactly one
+        of colcov or colchol is needed.
+
+    Examples
+    --------
+    Define a matrixvariate normal variable for given row and column covariance
+    matrices::
+
+        colcov = np.array([[1., 0.5], [0.5, 2]])
+        rowcov = np.array([[1, 0, 0], [0, 4, 0], [0, 0, 16]])
+        m = rowcov.shape[0]
+        n = colcov.shape[0]
+        mu = np.zeros((m, n))
+        vals = pm.MatrixNormal('vals', mu=mu, colcov=colcov,
+                               rowcov=rowcov, shape=(m, n))
+
+    Above, the ith row in vals has a variance that is scaled by 4^i.
+    Alternatively, row or column cholesky matrices could be substituted for
+    either covariance matrix. The MatrixNormal is quicker way compute
+    MvNormal(mu, np.kron(rowcov, colcov)) that takes advantage of kronecker product
+    properties for inversion. For example, if draws from MvNormal had the same
+    covariance structure, but were scaled by different powers of an unknown
+    constant, both the covariance and scaling could be learned as follows
+    (see the docstring of `LKJCholeskyCov` for more information about this)
+
+    .. code:: python
+
+        # Setup data
+        true_colcov = np.array([[1.0, 0.5, 0.1],
+                                [0.5, 1.0, 0.2],
+                                [0.1, 0.2, 1.0]])
+        m = 3
+        n = true_colcov.shape[0]
+        true_scale = 3
+        true_rowcov = np.diag([true_scale**(2*i) for i in range(m)])
+        mu = np.zeros((m, n))
+        true_kron = np.kron(true_rowcov, true_colcov)
+        data = np.random.multivariate_normal(mu.flatten(), true_kron)
+        data = data.reshape(m, n)
+
+        with pm.Model() as model:
+            # Setup right cholesky matrix
+            sd_dist = pm.HalfCauchy.dist(beta=2.5, shape=3)
+            colchol_packed = pm.LKJCholeskyCov('colcholpacked', n=3, eta=2,
+                                               sd_dist=sd_dist)
+            colchol = pm.expand_packed_triangular(3, colchol_packed)
+
+            # Setup left covariance matrix
+            scale = pm.Lognormal('scale', mu=np.log(true_scale), sigma=0.5)
+            rowcov = tt.nlinalg.diag([scale**(2*i) for i in range(m)])
+
+            vals = pm.MatrixNormal('vals', mu=mu, colchol=colchol, rowcov=rowcov,
+                                   observed=data, shape=(m, n))
+    """
+
+    def __init__(self, mu=0, rowcov=None, rowchol=None, rowtau=None,
+                 colcov=None, colchol=None, coltau=None, shape=None, *args,
+                 **kwargs):
+        self._setup_matrices(colcov, colchol, coltau, rowcov, rowchol, rowtau)
+        if shape is None:
+            raise TypeError('shape is a required argument')
+        assert len(shape) == 2, "shape must have length 2: mxn"
+        self.shape = shape
+        super().__init__(shape=shape, *args, **kwargs)
+        self.mu = tt.as_tensor_variable(mu)
+        self.mean = self.median = self.mode = self.mu
+        self.solve_lower = tt.slinalg.solve_lower_triangular
+        self.solve_upper = tt.slinalg.solve_upper_triangular
+
+    def _setup_matrices(self, colcov, colchol, coltau, rowcov, rowchol, rowtau):
+        cholesky = Cholesky(lower=True, on_error='raise')
+
+        # Among-row matrices
+        if len([i for i in [rowtau, rowcov, rowchol] if i is not None]) != 1:
+            raise ValueError('Incompatible parameterization. '
+                             'Specify exactly one of rowtau, rowcov, '
+                             'or rowchol.')
+        if rowcov is not None:
+            self.m = rowcov.shape[0]
+            self._rowcov_type = 'cov'
+            rowcov = tt.as_tensor_variable(rowcov)
+            if rowcov.ndim != 2:
+                raise ValueError('rowcov must be two dimensional.')
+            self.rowchol_cov = cholesky(rowcov)
+            self.rowcov = rowcov
+        elif rowtau is not None:
+            raise ValueError('rowtau not supported at this time')
+            self.m = rowtau.shape[0]
+            self._rowcov_type = 'tau'
+            rowtau = tt.as_tensor_variable(rowtau)
+            if rowtau.ndim != 2:
+                raise ValueError('rowtau must be two dimensional.')
+            self.rowchol_tau = cholesky(rowtau)
+            self.rowtau = rowtau
+        else:
+            self.m = rowchol.shape[0]
+            self._rowcov_type = 'chol'
+            if rowchol.ndim != 2:
+                raise ValueError('rowchol must be two dimensional.')
+            self.rowchol_cov = tt.as_tensor_variable(rowchol)
+
+        # Among-column matrices
+        if len([i for i in [coltau, colcov, colchol] if i is not None]) != 1:
+            raise ValueError('Incompatible parameterization. '
+                             'Specify exactly one of coltau, colcov, '
+                             'or colchol.')
+        if colcov is not None:
+            self.n = colcov.shape[0]
+            self._colcov_type = 'cov'
+            colcov = tt.as_tensor_variable(colcov)
+            if colcov.ndim != 2:
+                raise ValueError('colcov must be two dimensional.')
+            self.colchol_cov = cholesky(colcov)
+            self.colcov = colcov
+        elif coltau is not None:
+            raise ValueError('coltau not supported at this time')
+            self.n = coltau.shape[0]
+            self._colcov_type = 'tau'
+            coltau = tt.as_tensor_variable(coltau)
+            if coltau.ndim != 2:
+                raise ValueError('coltau must be two dimensional.')
+            self.colchol_tau = cholesky(coltau)
+            self.coltau = coltau
+        else:
+            self.n = colchol.shape[0]
+            self._colcov_type = 'chol'
+            if colchol.ndim != 2:
+                raise ValueError('colchol must be two dimensional.')
+            self.colchol_cov = tt.as_tensor_variable(colchol)
+
+    def random(self, point=None, size=None):
+        mu, colchol, rowchol = draw_values(
+                                [self.mu, self.colchol_cov, self.rowchol_cov],
+                                point=point,
+                                size=size)
+        if size is None:
+            size = ()
+        if size in (None, ()):
+            standard_normal = np.random.standard_normal((self.shape[0], colchol.shape[-1]))
+            samples = mu + np.matmul(rowchol, np.matmul(standard_normal, colchol.T))
+        else:
+            samples = []
+            size = tuple(np.atleast_1d(size))
+            if mu.shape == tuple(self.shape):
+                for _ in range(np.prod(size)):
+                    standard_normal = np.random.standard_normal((self.shape[0], colchol.shape[-1]))
+                    samples.append(mu + np.matmul(rowchol, np.matmul(standard_normal, colchol.T)))
+            else:
+                for j in range(np.prod(size)):
+                    standard_normal = np.random.standard_normal((self.shape[0], colchol[j].shape[-1]))
+                    samples.append(mu[j] +
+                                np.matmul(rowchol[j], np.matmul(standard_normal, colchol[j].T)))
+            samples = np.array(samples).reshape(size + tuple(self.shape))
+        return samples
+
+
+
+    def _trquaddist(self, value):
+        """Compute Tr[colcov^-1 @ (x - mu).T @ rowcov^-1 @ (x - mu)] and
+        the logdet of colcov and rowcov."""
+
+        delta = value - self.mu
+        rowchol_cov = self.rowchol_cov
+        colchol_cov = self.colchol_cov
+
+        # Find exponent piece by piece
+        right_quaddist = self.solve_lower(rowchol_cov, delta)
+        quaddist = tt.nlinalg.matrix_dot(right_quaddist.T, right_quaddist)
+        quaddist = self.solve_lower(colchol_cov, quaddist)
+        quaddist = self.solve_upper(colchol_cov.T, quaddist)
+        trquaddist = tt.nlinalg.trace(quaddist)
+
+        coldiag = tt.nlinalg.diag(colchol_cov)
+        rowdiag = tt.nlinalg.diag(rowchol_cov)
+        half_collogdet = tt.sum(tt.log(coldiag))  # logdet(M) = 2*Tr(log(L))
+        half_rowlogdet = tt.sum(tt.log(rowdiag))  # Using Cholesky: M = L L^T
+        return trquaddist, half_collogdet, half_rowlogdet
+
+    def logp(self, value):
+        trquaddist, half_collogdet, half_rowlogdet = self._trquaddist(value)
+        m = self.m
+        n = self.n
+        norm = - 0.5 * m * n * pm.floatX(np.log(2 * np.pi))
+        return norm - 0.5*trquaddist - m*half_collogdet - n*half_rowlogdet
+
+
+class KroneckerNormal(Continuous):
+    R"""
+    Multivariate normal log-likelihood with Kronecker-structured covariance.
+
+    .. math::
+
+       f(x \mid \mu, K) =
+           \frac{1}{(2\pi |K|)^{1/2}}
+           \exp\left\{ -\frac{1}{2} (x-\mu)^{\prime} K^{-1} (x-\mu) \right\}
+
+    ========  ==========================
+    Support   :math:`x \in \mathbb{R}^N`
+    Mean      :math:`\mu`
+    Variance  :math:`K = \bigotimes K_i` + \sigma^2 I_N
+    ========  ==========================
+
+    Parameters
+    ----------
+    mu : array
+        Vector of means, just as in `MvNormal`.
+    covs : list of arrays
+        The set of covariance matrices :math:`[K_1, K_2, ...]` to be
+        Kroneckered in the order provided :math:`\bigotimes K_i`.
+    chols : list of arrays
+        The set of lower cholesky matrices :math:`[L_1, L_2, ...]` such that
+        :math:`K_i = L_i L_i'`.
+    evds : list of tuples
+        The set of eigenvalue-vector, eigenvector-matrix pairs
+        :math:`[(v_1, Q_1), (v_2, Q_2), ...]` such that
+        :math:`K_i = Q_i \text{diag}(v_i) Q_i'`. For example::
+
+            v_i, Q_i = tt.nlinalg.eigh(K_i)
+
+    sigma : scalar, variable
+        Standard deviation of the Gaussian white noise.
+
+    Examples
+    --------
+    Define a multivariate normal variable with a covariance
+    :math:`K = K_1 \otimes K_2`
+
+    .. code:: python
+
+        K1 = np.array([[1., 0.5], [0.5, 2]])
+        K2 = np.array([[1., 0.4, 0.2], [0.4, 2, 0.3], [0.2, 0.3, 1]])
+        covs = [K1, K2]
+        N = 6
+        mu = np.zeros(N)
+        with pm.Model() as model:
+            vals = pm.KroneckerNormal('vals', mu=mu, covs=covs, shape=N)
+
+    Effeciency gains are made by cholesky decomposing :math:`K_1` and
+    :math:`K_2` individually rather than the larger :math:`K` matrix. Although
+    only two matrices :math:`K_1` and :math:`K_2` are shown here, an arbitrary
+    number of submatrices can be combined in this way. Choleskys and
+    eigendecompositions can be provided instead
+
+    .. code:: python
+
+        chols = [np.linalg.cholesky(Ki) for Ki in covs]
+        evds = [np.linalg.eigh(Ki) for Ki in covs]
+        with pm.Model() as model:
+            vals2 = pm.KroneckerNormal('vals2', mu=mu, chols=chols, shape=N)
+            # or
+            vals3 = pm.KroneckerNormal('vals3', mu=mu, evds=evds, shape=N)
+
+    neither of which will be converted. Diagonal noise can also be added to
+    the covariance matrix, :math:`K = K_1 \otimes K_2 + \sigma^2 I_N`.
+    Despite the noise removing the overall Kronecker structure of the matrix,
+    `KroneckerNormal` can continue to make efficient calculations by
+    utilizing eigendecompositons of the submatrices behind the scenes [1].
+    Thus,
+
+    .. code:: python
+
+        sigma = 0.1
+        with pm.Model() as noise_model:
+            vals = pm.KroneckerNormal('vals', mu=mu, covs=covs, sigma=sigma, shape=N)
+            vals2 = pm.KroneckerNormal('vals2', mu=mu, chols=chols, sigma=sigma, shape=N)
+            vals3 = pm.KroneckerNormal('vals3', mu=mu, evds=evds, sigma=sigma, shape=N)
+
+    are identical, with `covs` and `chols` each converted to
+    eigendecompositions.
+
+    References
+    ----------
+    .. [1] Saatchi, Y. (2011). "Scalable inference for structured Gaussian process models"
+    """
+
+    def __init__(self, mu, covs=None, chols=None, evds=None, sigma=None,
+                 *args, **kwargs):
+        self._setup(covs, chols, evds, sigma)
+        super().__init__(*args, **kwargs)
+        self.mu = tt.as_tensor_variable(mu)
+        self.mean = self.median = self.mode = self.mu
+
+    def _setup(self, covs, chols, evds, sigma):
+        self.cholesky = Cholesky(lower=True, on_error='raise')
+        if len([i for i in [covs, chols, evds] if i is not None]) != 1:
+            raise ValueError('Incompatible parameterization. '
+                             'Specify exactly one of covs, chols, '
+                             'or evds.')
+        self._isEVD = False
+        self.sigma = sigma
+        self.is_noisy = self.sigma is not None and self.sigma != 0
+        if covs is not None:
+            self._cov_type = 'cov'
+            self.covs = covs
+            if self.is_noisy:
+                # Noise requires eigendecomposition
+                eigh_map = map(eigh, covs)
+                self._setup_evd(eigh_map)
+            else:
+                # Otherwise use cholesky as usual
+                self.chols = list(map(self.cholesky, self.covs))
+                self.chol_diags = list(map(tt.nlinalg.diag, self.chols))
+                self.sizes = tt.as_tensor_variable(
+                                [chol.shape[0] for chol in self.chols])
+                self.N = tt.prod(self.sizes)
+        elif chols is not None:
+            self._cov_type = 'chol'
+            if self.is_noisy:  # A strange case...
+                # Noise requires eigendecomposition
+                covs = [tt.dot(chol, chol.T) for chol in chols]
+                eigh_map = map(eigh, covs)
+                self._setup_evd(eigh_map)
+            else:
+                self.chols = chols
+                self.chol_diags = list(map(tt.nlinalg.diag, self.chols))
+                self.sizes = tt.as_tensor_variable(
+                                [chol.shape[0] for chol in self.chols])
+                self.N = tt.prod(self.sizes)
+        else:
+            self._cov_type = 'evd'
+            self._setup_evd(evds)
+
+    def _setup_evd(self, eigh_iterable):
+        self._isEVD = True
+        eigs_sep, Qs = zip(*eigh_iterable)  # Unzip
+        self.Qs = list(map(tt.as_tensor_variable, Qs))
+        self.QTs = list(map(tt.transpose, self.Qs))
+
+        self.eigs_sep = list(map(tt.as_tensor_variable, eigs_sep))
+        self.eigs = kron_diag(*self.eigs_sep)  # Combine separate eigs
+        if self.is_noisy:
+            self.eigs += self.sigma**2
+        self.N = self.eigs.shape[0]
+
+    def _setup_random(self):
+        if not hasattr(self, 'mv_params'):
+            self.mv_params = {'mu': self.mu}
+            if self._cov_type == 'cov':
+                cov = kronecker(*self.covs)
+                if self.is_noisy:
+                    cov = cov + self.sigma**2 * tt.identity_like(cov)
+                self.mv_params['cov'] = cov
+            elif self._cov_type == 'chol':
+                if self.is_noisy:
+                    covs = []
+                    for eig, Q in zip(self.eigs_sep, self.Qs):
+                        cov_i = tt.dot(Q, tt.dot(tt.diag(eig), Q.T))
+                        covs.append(cov_i)
+                    cov = kronecker(*covs)
+                    if self.is_noisy:
+                        cov = cov + self.sigma**2 * tt.identity_like(cov)
+                    self.mv_params['chol'] = self.cholesky(cov)
+                else:
+                    self.mv_params['chol'] = kronecker(*self.chols)
+            elif self._cov_type == 'evd':
+                covs = []
+                for eig, Q in zip(self.eigs_sep, self.Qs):
+                    cov_i = tt.dot(Q, tt.dot(tt.diag(eig), Q.T))
+                    covs.append(cov_i)
+                cov = kronecker(*covs)
+                if self.is_noisy:
+                    cov = cov + self.sigma**2 * tt.identity_like(cov)
+                self.mv_params['cov'] = cov
+
+    def random(self, point=None, size=None):
+        # Expand params into terms MvNormal can understand to force consistency
+        self._setup_random()
+        dist = MvNormal.dist(**self.mv_params)
+        return dist.random(point, size)
+
+    def _quaddist(self, value):
+        """Computes the quadratic (x-mu)^T @ K^-1 @ (x-mu) and log(det(K))"""
+        if value.ndim > 2 or value.ndim == 0:
+            raise ValueError('Invalid dimension for value: %s' % value.ndim)
+        if value.ndim == 1:
+            onedim = True
+            value = value[None, :]
+        else:
+            onedim = False
+
+        delta = value - self.mu
+        if self._isEVD:
+            sqrt_quad = kron_dot(self.QTs, delta.T)
+            sqrt_quad = sqrt_quad/tt.sqrt(self.eigs[:, None])
+            logdet = tt.sum(tt.log(self.eigs))
+        else:
+            sqrt_quad = kron_solve_lower(self.chols, delta.T)
+            logdet = 0
+            for chol_size, chol_diag in zip(self.sizes, self.chol_diags):
+                logchol = tt.log(chol_diag) * self.N/chol_size
+                logdet += tt.sum(2*logchol)
+        # Square each sample
+        quad = tt.batched_dot(sqrt_quad.T, sqrt_quad.T)
+        if onedim:
+            quad = quad[0]
+        return quad, logdet
+
+    def logp(self, value):
+        quad, logdet = self._quaddist(value)
+        return - (quad + logdet + self.N*tt.log(2*np.pi)) / 2.0
